@@ -5,14 +5,14 @@ Citadel — name of my first home-lab. Here I'm going to document everything —
 # Server Speсifications
 
 ## Hardware Components
- **CPU**: AMD Epyc 7313
- **RAM**: MICRON 16GBx8 2RX8 DDR4-2666MHZ RDIMM
- **Storage**: 
+ * ***CPU**: AMD Epyc 7313
+ * ***RAM**: MICRON 16GBx8 2RX8 DDR4-2666MHZ RDIMM
+ * ***Storage**: 
 	-  HDD 8TB Seagate
 	-  HDD 8TB Western Digital Purple
 	-  SSD 1TB Kingston KC3000
- **Motherboard**: South H12D-8D
- **PSU**: be quiet! Pure Power 13 M 1000 Watt
+ * ***Motherboard**: South H12D-8D
+ * ***PSU**: be quiet! Pure Power 13 M 1000 Watt
 
 ## Infrastructure & Services
 
