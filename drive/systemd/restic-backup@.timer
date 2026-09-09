@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily restic backup (profile %i)
+
+[Timer]
+# 03:00 — after the Immich (02:00) and ownCloud (02:30) database dumps, so
+# every snapshot contains a fresh, consistent copy of both databases.
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,5 @@
+[Unit]
+Description=Check disk pressure and container health
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "/usr/local/bin/health-watch.sh | /usr/bin/systemd-cat -t health-watch -p warning"

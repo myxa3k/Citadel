@@ -1,0 +1,13 @@
+[Unit]
+Description=restic backup (profile %i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+Type=oneshot
+ExecStart=/usr/local/bin/restic-backup.sh %i
+# Backups must never starve the services people are actually using.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=infinity

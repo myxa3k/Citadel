@@ -1,0 +1,96 @@
+# ownCloud Server — file sync & share
+# Adapted from the official compose:
+#   * user files -> /mnt/hdd/owncloud  (1T, ZFS mirror)
+#   * mariadb/redis state -> ./mysql, ./redis (NVMe)
+#   * port bound to 127.0.0.1 — exposure happens via `tailscale serve` only
+name: owncloud
+
+services:
+  owncloud:
+    container_name: owncloud_server
+    image: owncloud/server:${OWNCLOUD_VERSION}
+    restart: always
+    ports:
+      - '127.0.0.1:8080:8080'
+      # Also on the tailnet address, for the reverse proxy on another host.
+      - '${TAILSCALE_IP}:8080:8080'
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      OWNCLOUD_DOMAIN: ${OWNCLOUD_DOMAIN}
+      OWNCLOUD_TRUSTED_DOMAINS: ${OWNCLOUD_TRUSTED_DOMAINS}
+      OWNCLOUD_DB_TYPE: mysql
+      OWNCLOUD_DB_NAME: owncloud
+      OWNCLOUD_DB_USERNAME: owncloud
+      OWNCLOUD_DB_PASSWORD: ${DB_PASSWORD}
+      OWNCLOUD_DB_HOST: mariadb
+      OWNCLOUD_ADMIN_USERNAME: ${ADMIN_USERNAME}
+      OWNCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      OWNCLOUD_MYSQL_UTF8MB4: 'true'
+      OWNCLOUD_REDIS_ENABLED: 'true'
+      OWNCLOUD_REDIS_HOST: redis
+      # Behind `tailscale serve`, which terminates TLS on :8443 and forwards
+      # plain HTTP here. Without these ownCloud builds http:// links and the
+      # desktop/mobile clients break on redirects. Setting them via env (not
+      # `occ`) because the entrypoint regenerates config.php on every start.
+      # Protocol is pinned because TLS always terminates upstream (tailscale
+      # serve or Nginx Proxy Manager), but the HOST is deliberately NOT pinned:
+      # the same instance is reached both as shiro-drive…ts.net:8443 and as a
+      # citadel-home.xyz name, and a hard overwritehost would break one of them.
+      OWNCLOUD_OVERWRITE_PROTOCOL: https
+      OWNCLOUD_OVERWRITE_CLI_URL: https://owncloud.citadel-home.xyz/
+      OWNCLOUD_TRUSTED_PROXIES: 172.28.7.1
+      OWNCLOUD_FORWARDED_FOR_HEADERS: HTTP_X_FORWARDED_FOR
+      # Rotate owncloud.log at 10 MB. Unbounded by default — a noisy app can
+      # quietly grow it until the data disk fills.
+      OWNCLOUD_LOG_ROTATE_SIZE: '10485760'
+    healthcheck:
+      test: ['CMD', '/usr/bin/healthcheck']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    volumes:
+      - /mnt/hdd/owncloud:/mnt/data
+
+  mariadb:
+    container_name: owncloud_mariadb
+    image: mariadb:10.11
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_USER: owncloud
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: owncloud
+      MARIADB_AUTO_UPGRADE: '1'
+    command: ['--max-allowed-packet=128M', '--innodb-log-file-size=64M']
+    healthcheck:
+      test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - ./mysql:/var/lib/mysql
+
+  redis:
+    container_name: owncloud_redis
+    image: redis:7-alpine
+    restart: always
+    command: ['--databases', '1']
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - ./redis:/data
+
+# Pinned subnet so the gateway address in OWNCLOUD_TRUSTED_PROXIES stays stable
+# across `docker compose down` / `up` cycles.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.7.0/24

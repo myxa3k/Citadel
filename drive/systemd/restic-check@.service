@@ -1,0 +1,10 @@
+[Unit]
+Description=restic repository integrity check (profile %i)
+
+[Service]
+Environment=RESTIC_CACHE_DIR=/var/cache/restic
+Type=oneshot
+ExecStart=/bin/bash -c "set -a; . /etc/restic/%i.env; set +a; exec restic check --read-data-subset=5%%"
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=infinity
