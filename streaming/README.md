@@ -176,9 +176,16 @@ The language profile is **Russian first, English second**, applied by default
 to everything new.
 
 **Russian anime subtitles mostly do not come from subtitle providers.** They
-ship inside Russian releases as soft-subs, and the reliable way to get them
-is to download a release that already has them — which is what multi-title
-search above is for. Checked on real files: a Russian release of one show
+ship with the release — either muxed into the `.mkv`, or as separate `.ass`
+files beside it — and the reliable way to get them is to download a release
+that already has them, which is what multi-title search above is for. The
+importer links those sidecar files in as `<Episode>.ru.ass`, the naming
+Jellyfin reads as a selectable Russian track.
+
+Language is decided by sampling the `Dialogue:` lines rather than the head of
+the file: an `.ass` can open with megabytes of styling before the first line
+of speech, and in one real release the first Cyrillic character sat at byte
+2.8M of 2.9M. Reading a prefix labelled a Russian subtitle as English. Checked on real files: a Russian release of one show
 carried `rus (Надписи)`, `rus (Полные)`, `eng`, four Russian dubs and the
 Japanese track; the English release of another carried no Russian at all,
 and no provider had any either.
@@ -256,6 +263,16 @@ config lives in `./<service>/config/` and survives a container being replaced.
 - **qBittorrent's WebUI answers `204` to a failed login**, not just a
   successful one. Only the presence of the `QBT_SID` cookie proves the
   password was right; the bot's client checks for exactly that.
+- **`/torrents/add` answers `Ok.` even when the torrent is dropped**, so the
+  bot polls for the new infohash instead of trusting the response. The usual
+  cause is a duplicate: multi-title search surfaces the same release under
+  both its English and Russian names, and picking the other one looks like a
+  fresh download but silently does nothing. That now reports "уже скачано"
+  rather than a queued download that never starts.
+- **Deleting a series in Jellyfin deletes the files**, if the library allows
+  it — the hardlinks in `media/` go, but the originals in `downloads/` stay,
+  so re-importing from the torrent restores everything without downloading
+  again.
 - **`/mnt/storage` is mounted whole** into Sonarr, Radarr, Bazarr and
   qBittorrent as `/data`, so hardlinks work between `downloads/` and `media/`.
   Mounting the two separately would make every import a full copy.

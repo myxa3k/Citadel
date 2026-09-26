@@ -25,6 +25,10 @@ SEARCH_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
+class TorrentNotAdded(RuntimeError):
+    """qBittorrent accepted the request but the torrent never showed up."""
+
+
 @dataclass(slots=True)
 class Release:
     """One search result, trimmed to what the bot actually shows or needs."""
@@ -148,10 +152,21 @@ class QBittorrentClient:
             raise RuntimeError("qBittorrent rejected the credentials")
 
     async def add(self, url: str, category: str, savepath: str | None = None) -> None:
+        """Hand a torrent to qBittorrent, and confirm it actually arrived.
+
+        qBittorrent answers "Ok." to /torrents/add even when it silently
+        drops the torrent -- most often because the same infohash is already
+        present under a different name, which happens a lot here since the
+        same release is indexed under both its English and Russian titles.
+        Trusting the status code means telling the user a download started
+        when nothing did.
+        """
         client = await self._session()
         data = {"urls": url, "category": category}
         if savepath:
             data["savepath"] = savepath
+
+        before = {t.get("hash") for t in await self.torrents()}
 
         resp = await client.post(urljoin(self._base, "api/v2/torrents/add"), data=data)
         # A session that outlived its cookie comes back as 403; log in again
@@ -162,6 +177,18 @@ class QBittorrentClient:
                 urljoin(self._base, "api/v2/torrents/add"), data=data
             )
         resp.raise_for_status()
+
+        # Adding is asynchronous -- the torrent appears a moment later, so
+        # poll briefly instead of checking once and declaring failure.
+        for _ in range(10):
+            await asyncio.sleep(1)
+            if {t.get("hash") for t in await self.torrents()} - before:
+                return
+
+        raise TorrentNotAdded(
+            "qBittorrent приняло запрос, но торрент не появился — "
+            "скорее всего он уже скачан под другим названием"
+        )
 
     async def delete(self, torrent_hash: str, delete_files: bool = True) -> None:
         """Drop a torrent. `delete_files` is on by default because the only

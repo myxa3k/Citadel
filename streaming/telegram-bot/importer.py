@@ -20,6 +20,10 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".m4v", ".ts"}
+# Russian releases very often ship subtitles as separate files next to the
+# video rather than muxed in. Leaving them behind is how a download that
+# *did* come with Russian subs ends up looking like one that didn't.
+SUBTITLE_SUFFIXES = {".ass", ".srt", ".ssa", ".sub", ".vtt"}
 # Below this, a file is a sample, a trailer, or a stray extra rather than an
 # episode worth putting in the library.
 MIN_VIDEO_BYTES = 50 * 1024 * 1024
@@ -115,6 +119,88 @@ def episode_number(name: str) -> tuple[int, int] | None:
     return None
 
 
+def _subtitle_files(source: Path) -> list[Path]:
+    if source.is_file():
+        return []
+    return sorted(
+        p
+        for p in source.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUBTITLE_SUFFIXES
+    )
+
+
+def _link_subtitles(
+    subtitles: list[Path], video_target: Path, video_source: Path
+) -> int:
+    """Link subtitles belonging to one episode next to its video file.
+
+    Jellyfin matches a subtitle to a video by filename stem, with the
+    language as the suffix before the extension -- `Show - S01E01.ru.ass`
+    attaches to `Show - S01E01.mkv` and shows up as Russian.
+    """
+    linked = 0
+    for subtitle in subtitles:
+        # Same stem as the video it shipped with, ignoring any language part
+        # the release already added.
+        if subtitle.stem.split(".")[0] != video_source.stem.split(".")[0]:
+            continue
+
+        lang = _subtitle_language(subtitle)
+        suffix = f".{lang}{subtitle.suffix}" if lang else subtitle.suffix
+        target = video_target.with_suffix("")
+        target = target.with_name(target.name + suffix)
+        if target.exists():
+            continue
+        try:
+            target.hardlink_to(subtitle)
+            linked += 1
+        except OSError:
+            log.exception("could not link subtitle %s", subtitle)
+    return linked
+
+
+def _subtitle_language(path: Path) -> str | None:
+    """Guess the language tag for a subtitle file.
+
+    A tag already in the name wins. Otherwise the file is sampled: Cyrillic
+    in the dialogue means Russian, which is the case worth getting right --
+    releases routinely ship a Russian .ass with no language in its name, and
+    Jellyfin would otherwise label it "Unknown".
+    """
+    parts = path.stem.lower().split(".")
+    for part in parts[1:]:
+        if part in {"ru", "rus", "russian"}:
+            return "ru"
+        if part in {"en", "eng", "english"}:
+            return "en"
+
+    try:
+        text = path.read_bytes().decode("utf-8", "ignore")
+    except OSError:
+        return None
+
+    # Sample the actual dialogue, not the head of the file. An .ass can open
+    # with megabytes of styling and karaoke timing before the first line of
+    # speech -- in one real release the first Cyrillic character sat at byte
+    # 2.8M of a 2.9M file, so reading a prefix reports the wrong language.
+    spoken = "\n".join(
+        line.split(",", 9)[-1]
+        for line in text.splitlines()
+        if line.startswith(("Dialogue:", "Comment:"))
+    )
+    sample = spoken or text
+
+    cyrillic = len(re.findall(r"[А-Яа-яЁё]", sample))
+    latin = len(re.findall(r"[A-Za-z]", sample))
+    # Russian subtitles still carry Latin characters in typesetting tags and
+    # signs, so compare counts instead of taking whichever appears first.
+    if cyrillic > 20 and cyrillic > latin * 0.2:
+        return "ru"
+    if latin > 20:
+        return "en"
+    return None
+
+
 def _video_files(source: Path) -> list[Path]:
     if source.is_file():
         return [source] if source.suffix.lower() in VIDEO_SUFFIXES else []
@@ -141,6 +227,7 @@ def import_download(
     if not files:
         return ImportResult(title, media_root, 0, 0)
 
+    subtitles = _subtitle_files(source)
     linked = skipped = 0
 
     if kind == "movies":
@@ -154,6 +241,7 @@ def import_download(
         else:
             target.hardlink_to(main)
             linked += 1
+        linked += _link_subtitles(subtitles, target, main)
         return ImportResult(title, destination, linked, skipped)
 
     show_root = media_root / title
@@ -176,14 +264,19 @@ def import_download(
 
         if target.exists():
             skipped += 1
-            continue
-        try:
-            target.hardlink_to(f)
-            linked += 1
-        except OSError:
-            # Different filesystem (or a permissions problem) -- a copy would
-            # silently double disk use, so report instead of hiding it.
-            log.exception("could not hardlink %s -> %s", f, target)
-            skipped += 1
+        else:
+            try:
+                target.hardlink_to(f)
+                linked += 1
+            except OSError:
+                # Different filesystem (or a permissions problem) -- a copy
+                # would silently double disk use, so report instead of hiding it.
+                log.exception("could not hardlink %s -> %s", f, target)
+                skipped += 1
+                continue
+
+        # Subtitles are linked even when the video was already there, so an
+        # episode imported before this feature existed still picks them up.
+        linked += _link_subtitles(subtitles, target, f)
 
     return ImportResult(title, show_root, linked, skipped)

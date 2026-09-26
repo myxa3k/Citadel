@@ -42,6 +42,7 @@ from clients import (
     QBittorrentClient,
     Release,
     SonarrClient,
+    TorrentNotAdded,
 )
 from importer import import_download
 from ranking import Scored, rank
@@ -476,6 +477,19 @@ async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         await qbit.add(release.download_url, category=CATEGORY, savepath=savepath)
+    except TorrentNotAdded:
+        # Not a failure so much as "you already have this" -- the same
+        # release is indexed under both its English and Russian titles, so
+        # picking the other one looks like a new download but isn't.
+        log.info("torrent already present: %s", release.title)
+        await query_cb.edit_message_text(
+            f"ℹ️ <b>{html.escape(release.title[:200])}</b>\n\n"
+            "Уже скачано — этот релиз есть в загрузках под другим названием.\n"
+            "Смотри в Jellyfin, или /status чтобы проверить.",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
     except Exception as exc:  # noqa: BLE001
         log.exception("failed to queue torrent")
         await query_cb.edit_message_text(f"Не удалось поставить на закачку: {exc}")
