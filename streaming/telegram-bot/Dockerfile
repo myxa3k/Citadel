@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py clients.py ranking.py importer.py ./
+COPY bot.py clients.py ranking.py importer.py titles.py ./
 
 # Runs as a non-root user; it only needs outbound HTTP, no file access.
 RUN useradd --create-home --uid 1000 bot

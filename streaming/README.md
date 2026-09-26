@@ -72,10 +72,21 @@ qBittorrent's state name: `💀 нет раздающих` when the swarm is emp
 never finish — cancel it), `⏳ ищу пиров` when seeders exist but aren't
 connected yet (usually resolves itself).
 
-**Search by the name the tracker uses.** Russian trackers list
-«Синий экзорцист», not "Blue Exorcist" — the bot passes the query through
-untouched, so either works depending on where the release lives. This is the
-whole reason the bot exists: see "Why the bot" below.
+**Type any name you like.** Before searching, the bot resolves the title
+through Shikimori (Russian database) and AniList (romaji/English/native), then
+searches every name at once and merges the results. `Yani Neko` also searches
+`Табакошка`; `Синий экзорцист` also searches `Ao no Exorcist`.
+
+This matters more than it sounds. Trackers index the same show under
+different names — English and anime trackers use romaji, Russian trackers use
+the Russian title — so searching one name finds one half of what exists. The
+Russian half is the half carrying Russian audio and subtitles: searching
+`Yani Neko` alone returned 103 results, none of them Russian, while adding
+`Табакошка` surfaced two Russian releases with 52 and 30 seeders.
+
+Duplicates are collapsed by title and size rather than by download URL,
+because Prowlarr signs those per request and the same release comes back
+under a different URL for each name searched.
 
 ## From "downloaded" to "watchable"
 
@@ -163,6 +174,26 @@ nothing.
 Bazarr pulls the library from Sonarr and Radarr and fetches subtitles for it.
 The language profile is **Russian first, English second**, applied by default
 to everything new.
+
+**Russian anime subtitles mostly do not come from subtitle providers.** They
+ship inside Russian releases as soft-subs, and the reliable way to get them
+is to download a release that already has them — which is what multi-title
+search above is for. Checked on real files: a Russian release of one show
+carried `rus (Надписи)`, `rus (Полные)`, `eng`, four Russian dubs and the
+Japanese track; the English release of another carried no Russian at all,
+and no provider had any either.
+
+Sources that sound like they should help, and don't:
+
+| Source | Reality |
+|---|---|
+| Kitsunekko | Japanese, Chinese and Korean only — there is no Russian section |
+| AniLibria | dubs, not subtitles, and a narrow catalogue |
+| fansubs.ru | times out from this host |
+| AnimeLib and similar streaming sites | no open API; subtitles are served to their player, not downloadable |
+
+So Bazarr is worth having for live-action and for English subtitles, but for
+anime the release choice does the work.
 
 Provider choice is constrained by the same thing that killed RuTracker: this
 host's IP is a datacentre address, and most subtitle sites treat it

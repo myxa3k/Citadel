@@ -64,6 +64,12 @@ class ImportResult:
 
 def clean_title(raw: str) -> str:
     """Turn a release folder name into something usable as a library folder."""
+    # Fansub groups prefix their name in brackets ("[smol] YuruYuri ..."), and
+    # leaving it in means Jellyfin and Bazarr both fail to identify the show.
+    # Only square brackets, and only when something follows: "(500) Days of
+    # Summer" starts with a parenthesised number that is part of the title.
+    raw = re.sub(r"^\s*\[[^\]]{1,30}\]\s*(?=\S)", "", raw)
+
     # Russian releases are often "Русское / English / Original (year) tags" --
     # the Latin part matches metadata providers far better than the Cyrillic.
     parts = [p.strip() for p in raw.split("/") if p.strip()]

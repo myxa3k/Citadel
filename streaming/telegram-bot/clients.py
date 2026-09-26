@@ -8,6 +8,7 @@ retry/timeout rules live next to the calls they protect.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -81,6 +82,36 @@ class ProwlarrClient:
         # seeders won't finish downloading -- neither belongs in the list the
         # user picks from.
         return [r for r in releases if r.download_url and r.seeders > 0]
+
+    async def search_many(self, queries: list[str], limit: int = 60) -> list[Release]:
+        """Search several titles at once and merge the results.
+
+        Trackers index the same show under different names -- the English or
+        romaji one on anime trackers, the Russian one on Russian trackers.
+        Searching only what the user typed finds only that half, and the
+        Russian half is where Russian audio and subtitles are.
+        """
+        results = await asyncio.gather(
+            *(self.search(q, limit=limit) for q in queries),
+            return_exceptions=True,
+        )
+
+        merged: dict[str, Release] = {}
+        for query, result in zip(queries, results):
+            if isinstance(result, Exception):
+                # One dead indexer or a timeout on one name shouldn't lose
+                # the results the other names found.
+                log.warning("search failed for %r: %s", query, result)
+                continue
+            for release in result:
+                # The same release comes back under several names. Its
+                # download URL is not stable across queries (Prowlarr signs
+                # them per request), so identity is title plus size -- two
+                # distinct releases never share both.
+                key = f"{release.title}|{release.size}"
+                merged.setdefault(key, release)
+
+        return list(merged.values())
 
 
 class QBittorrentClient:
@@ -167,6 +198,81 @@ class QBittorrentClient:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+
+class SonarrClient:
+    """Registers a show in Sonarr so Bazarr can see it.
+
+    The bot downloads outside Sonarr (it can only search English titles), so
+    nothing it fetches exists as far as Sonarr is concerned -- and Bazarr
+    takes its library from Sonarr, not from disk. Adding the series after the
+    fact is what makes subtitles possible.
+    """
+
+    def __init__(self, base_url: str, api_key: str) -> None:
+        self._base = base_url.rstrip("/") + "/"
+        self._headers = {"X-Api-Key": api_key}
+
+    async def lookup(self, term: str, limit: int = 5) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                urljoin(self._base, "api/v3/series/lookup"),
+                params={"term": term},
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            return resp.json()[:limit]
+
+    async def existing_tvdb_ids(self) -> set[int]:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                urljoin(self._base, "api/v3/series"), headers=self._headers
+            )
+            resp.raise_for_status()
+            return {s.get("tvdbId") for s in resp.json() if s.get("tvdbId")}
+
+    async def add_series(
+        self,
+        series: dict[str, Any],
+        root_folder: str,
+        quality_profile_id: int,
+        season_folder: bool = True,
+    ) -> dict[str, Any]:
+        """Add a looked-up series, pointed at files that are already on disk.
+
+        `monitor: existing` plus no search means Sonarr adopts what's there
+        and watches for future episodes, without immediately trying to
+        re-download the season the bot just fetched.
+        """
+        payload = {
+            **series,
+            "rootFolderPath": root_folder,
+            "qualityProfileId": quality_profile_id,
+            "seasonFolder": season_folder,
+            "monitored": True,
+            "addOptions": {
+                "monitor": "existing",
+                "searchForMissingEpisodes": False,
+                "searchForCutoffUnmetEpisodes": False,
+            },
+        }
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.post(
+                urljoin(self._base, "api/v3/series"),
+                json=payload,
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def rescan(self, series_id: int) -> None:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.post(
+                urljoin(self._base, "api/v3/command"),
+                json={"name": "RescanSeries", "seriesId": series_id},
+                headers=self._headers,
+            )
+            resp.raise_for_status()
 
 
 class JellyfinClient:

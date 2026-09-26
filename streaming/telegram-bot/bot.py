@@ -36,9 +36,16 @@ from telegram.ext import (
     filters,
 )
 
-from clients import JellyfinClient, ProwlarrClient, QBittorrentClient, Release
+from clients import (
+    JellyfinClient,
+    ProwlarrClient,
+    QBittorrentClient,
+    Release,
+    SonarrClient,
+)
 from importer import import_download
 from ranking import Scored, rank
+from titles import alternative_titles
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", level=logging.INFO
@@ -74,6 +81,9 @@ class Config:
     qbit_pass: str
     jellyfin_url: str | None
     jellyfin_key: str | None
+    sonarr_url: str | None
+    sonarr_key: str | None
+    sonarr_profile_id: int
     save_paths: dict[str, str] = field(default_factory=dict)
     media_paths: dict[str, str] = field(default_factory=dict)
 
@@ -85,6 +95,8 @@ class Config:
         thread = os.environ.get("TELEGRAM_TOPIC_STREAMING", "").strip()
         jellyfin_url = os.environ.get("JELLYFIN_URL", "").strip() or None
         jellyfin_key = os.environ.get("JELLYFIN_API_KEY", "").strip() or None
+        sonarr_url = os.environ.get("SONARR_URL", "").strip() or None
+        sonarr_key = os.environ.get("SONARR_API_KEY", "").strip() or None
 
         return cls(
             token=_env("TELEGRAM_BOT_TOKEN"),
@@ -98,6 +110,9 @@ class Config:
             qbit_pass=_env("QBITTORRENT_PASS"),
             jellyfin_url=jellyfin_url,
             jellyfin_key=jellyfin_key,
+            sonarr_url=sonarr_url,
+            sonarr_key=sonarr_key,
+            sonarr_profile_id=int(os.environ.get("SONARR_PROFILE_ID", "1")),
             save_paths={
                 "anime": os.environ.get("PATH_ANIME", "/data/downloads/anime"),
                 "series": os.environ.get("PATH_SERIES", "/data/downloads/series"),
@@ -344,9 +359,24 @@ async def _do_search(
 
     status = await update.effective_message.reply_text(f"🔍 Ищу «{query}»…")
 
+    # Russian trackers index the same show under its Russian name, so
+    # searching only what was typed finds half of what exists -- and the
+    # Russian half is the one carrying Russian audio and subtitles.
+    try:
+        names = await alternative_titles(query)
+    except Exception:  # noqa: BLE001 - never let this block the search itself
+        log.exception("alternative title lookup failed")
+        names = [query]
+
+    if len(names) > 1:
+        await status.edit_text(
+            f"🔍 Ищу «{query}»…\n<i>также: {html.escape(', '.join(names[1:]))}</i>",
+            parse_mode=ParseMode.HTML,
+        )
+
     prowlarr: ProwlarrClient = context.bot_data["prowlarr"]
     try:
-        releases = await prowlarr.search(query)
+        releases = await prowlarr.search_many(names)
     except Exception as exc:  # noqa: BLE001
         log.exception("search failed")
         await status.edit_text(f"Поиск не удался: {exc}")
@@ -546,6 +576,107 @@ async def check_finished(context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML,
         )
 
+        if kind != "movies":
+            await _offer_sonarr(context, config, result.title, media_root)
+
+
+async def _offer_sonarr(
+    context: ContextTypes.DEFAULT_TYPE,
+    config: Config,
+    title: str,
+    media_root: str,
+) -> None:
+    """Propose registering the show in Sonarr, so Bazarr can fetch subtitles.
+
+    Deliberately a question rather than an automatic add: Sonarr looks titles
+    up in TheTVDB, and for a recent or oddly-named show the top hit can be a
+    completely unrelated series. Adding that silently would have Bazarr
+    downloading subtitles for the wrong programme, which is worse than having
+    none.
+    """
+    sonarr: SonarrClient | None = context.bot_data.get("sonarr")
+    if sonarr is None:
+        return
+
+    try:
+        matches = await sonarr.lookup(title, limit=3)
+        known = await sonarr.existing_tvdb_ids()
+    except Exception:  # noqa: BLE001
+        log.exception("sonarr lookup failed for %s", title)
+        return
+
+    matches = [m for m in matches if m.get("tvdbId") not in known]
+    if not matches:
+        return
+
+    key = f"{len(PENDING_SONARR)}:{title}"
+    PENDING_SONARR[key] = (matches, media_root)
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"✅ {m.get('title', '?')[:40]} ({m.get('year') or '?'})",
+                callback_data=f"sonarr:{key}:{i}",
+            )
+        ]
+        for i, m in enumerate(matches)
+    ]
+    rows.append([InlineKeyboardButton("✖️ не надо", callback_data=f"sonarr:{key}:x")])
+
+    await context.bot.send_message(
+        chat_id=config.chat_id,
+        message_thread_id=config.thread_id,
+        text=(
+            f"Добавить <b>{html.escape(title)}</b> в Sonarr?\n"
+            "Тогда подтянутся субтитры и новые серии будут качаться сами.\n\n"
+            "<i>Проверь, что это тот сериал:</i>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+# Pending Sonarr confirmations, keyed per prompt. In memory only: if the bot
+# restarts before you answer, the show is still in the library and watchable
+# -- only the subtitle wiring is missed, and /sonarr can redo it.
+PENDING_SONARR: dict[str, tuple[list[dict[str, Any]], str]] = {}
+
+
+async def on_sonarr_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, key, choice = query_cb.data.split(":", 2)
+    entry = PENDING_SONARR.pop(key, None)
+    if entry is None:
+        await query_cb.edit_message_text("Это предложение устарело.")
+        return
+
+    if choice == "x":
+        await query_cb.edit_message_text("Ок, не добавляю.")
+        return
+
+    matches, media_root = entry
+    series = matches[int(choice)]
+    config: Config = context.bot_data["config"]
+    sonarr: SonarrClient = context.bot_data["sonarr"]
+
+    try:
+        added = await sonarr.add_series(
+            series, media_root, config.sonarr_profile_id
+        )
+        await sonarr.rescan(added["id"])
+    except Exception as exc:  # noqa: BLE001
+        log.exception("failed to add series to sonarr")
+        await query_cb.edit_message_text(f"Не получилось добавить: {exc}")
+        return
+
+    await query_cb.edit_message_text(
+        f"✅ <b>{html.escape(series.get('title', '?'))}</b> добавлен в Sonarr.\n"
+        "Bazarr подтянет субтитры в течение нескольких минут.",
+        parse_mode=ParseMode.HTML,
+    )
+
 
 def _kind_for(save_path: str, config: Config) -> str:
     for kind, path in config.save_paths.items():
@@ -582,6 +713,8 @@ def main() -> None:
         app.bot_data["jellyfin"] = JellyfinClient(
             config.jellyfin_url, config.jellyfin_key
         )
+    if config.sonarr_url and config.sonarr_key:
+        app.bot_data["sonarr"] = SonarrClient(config.sonarr_url, config.sonarr_key)
 
     # Only listen to the configured chat: the bot token is shared with the
     # infrastructure notifier, so it can be messaged from anywhere.
@@ -593,6 +726,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status, filters=chat_filter))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
+    app.add_handler(CallbackQueryHandler(on_sonarr_choice, pattern=r"^sonarr:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
