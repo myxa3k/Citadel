@@ -119,6 +119,8 @@ services:
       # reports resolve here too and finished downloads can be hardlinked
       # into the library without copying.
       - /mnt/storage:/data
+      # Followed shows. Outside the image so the list survives a rebuild.
+      - ./telegram-bot/state:/state
     restart: unless-stopped
     depends_on:
       - streaming_prowlarr

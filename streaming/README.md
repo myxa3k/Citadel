@@ -72,6 +72,20 @@ qBittorrent's state name: `💀 нет раздающих` when the swarm is emp
 never finish — cancel it), `⏳ ищу пиров` when seeders exist but aren't
 connected yet (usually resolves itself).
 
+## Following a show
+
+`/follow <name>` (or the button offered after an import) adds a show to a
+once-a-day check. New releases that haven't been offered before come back as
+the same list of buttons a search produces — it proposes, never downloads on
+its own, which is the point of the whole setup.
+
+The first check records everything currently available without reporting it,
+otherwise following a finished show would dump its entire back catalogue into
+the chat. `/following` lists what's watched, `/unfollow` stops.
+
+The list lives in `telegram-bot/state/following.json`, mounted from the host
+so it survives an image rebuild. It's plain JSON and safe to edit by hand.
+
 **Type any name you like.** Before searching, the bot resolves the title
 through Shikimori (Russian database) and AniList (romaji/English/native), then
 searches every name at once and merges the results. `Yani Neko` also searches
@@ -141,9 +155,17 @@ releases were never in the result set to begin with. The bot sidesteps it by
 querying Prowlarr directly with whatever you typed, and by letting you choose
 the release rather than inferring which one you meant.
 
-Sonarr and Radarr still earn their place: they watch tracked shows for new
-episodes, rename and organise files into the library, and hand subtitles to
-Bazarr. They just aren't the way a *specific* thing gets downloaded.
+**Sonarr and Radarr are not in this path at all.** They were tried as a way
+to reach Bazarr — which builds its library from Sonarr rather than from disk
+— but the trade was bad: Sonarr can only search the English title, so it
+finds English releases and misses the Russian ones that carry the audio and
+subtitles actually wanted. It also renames what it adopts, and once deleted
+a folder of imported files while trying to; `renameEpisodes` is off for that
+reason. They stay running but do nothing the bot depends on.
+
+New episodes of a show are handled by `/follow` instead, which reuses the
+bot's own multi-title search and so finds Russian releases the same way the
+first download did.
 
 ## Indexers
 

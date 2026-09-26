@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +42,9 @@ from clients import (
     ProwlarrClient,
     QBittorrentClient,
     Release,
-    SonarrClient,
     TorrentNotAdded,
 )
+from following import FollowStore
 from importer import import_download
 from ranking import Scored, rank
 from titles import alternative_titles
@@ -82,9 +83,7 @@ class Config:
     qbit_pass: str
     jellyfin_url: str | None
     jellyfin_key: str | None
-    sonarr_url: str | None
-    sonarr_key: str | None
-    sonarr_profile_id: int
+    follow_state: str
     save_paths: dict[str, str] = field(default_factory=dict)
     media_paths: dict[str, str] = field(default_factory=dict)
 
@@ -96,8 +95,6 @@ class Config:
         thread = os.environ.get("TELEGRAM_TOPIC_STREAMING", "").strip()
         jellyfin_url = os.environ.get("JELLYFIN_URL", "").strip() or None
         jellyfin_key = os.environ.get("JELLYFIN_API_KEY", "").strip() or None
-        sonarr_url = os.environ.get("SONARR_URL", "").strip() or None
-        sonarr_key = os.environ.get("SONARR_API_KEY", "").strip() or None
 
         return cls(
             token=_env("TELEGRAM_BOT_TOKEN"),
@@ -111,9 +108,7 @@ class Config:
             qbit_pass=_env("QBITTORRENT_PASS"),
             jellyfin_url=jellyfin_url,
             jellyfin_key=jellyfin_key,
-            sonarr_url=sonarr_url,
-            sonarr_key=sonarr_key,
-            sonarr_profile_id=int(os.environ.get("SONARR_PROFILE_ID", "1")),
+            follow_state=os.environ.get("FOLLOW_STATE", "/state/following.json"),
             save_paths={
                 "anime": os.environ.get("PATH_ANIME", "/data/downloads/anime"),
                 "series": os.environ.get("PATH_SERIES", "/data/downloads/series"),
@@ -205,6 +200,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/search &lt;название&gt; — искать\n"
         "/status — что сейчас качается\n"
         "/cancel — отменить загрузку\n"
+        "/follow &lt;название&gt; — следить за новыми сериями\n"
+        "/following — за чем слежу\n"
+        "/unfollow — перестать следить\n"
         "/help — эта справка\n\n"
         "🌱 в списке — сколько человек раздаёт. Ноль означает, что "
         "скачать не получится, сколько ни жди.",
@@ -290,6 +288,213 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     await _do_search(update, context, query)
+
+
+async def _offer_follow(
+    context: ContextTypes.DEFAULT_TYPE, config: Config, title: str
+) -> None:
+    """Offer to watch this show for new episodes."""
+    store: FollowStore = context.bot_data["follows"]
+    if store.key(title) in {store.key(s.title) for s in store.all()}:
+        return
+
+    key = _remember_pending(context, title)
+    await context.bot.send_message(
+        chat_id=config.chat_id,
+        message_thread_id=config.thread_id,
+        text=(
+            f"Следить за <b>{html.escape(title)}</b>?\n"
+            "Раз в день проверю новые серии и пришлю варианты."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔔 Следить", callback_data=f"follow:{key}"),
+                    InlineKeyboardButton("✖️ Не надо", callback_data=f"follow:x"),
+                ]
+            ]
+        ),
+    )
+
+
+def _remember_pending(context: ContextTypes.DEFAULT_TYPE, title: str) -> str:
+    pending = context.bot_data.setdefault("pending_follow", {})
+    key = str(len(pending))
+    pending[key] = title
+    return key
+
+
+async def on_follow_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, key = query_cb.data.split(":", 1)
+    if key == "x":
+        await query_cb.edit_message_text("Ок, не слежу.")
+        return
+
+    title = context.bot_data.get("pending_follow", {}).get(key)
+    if not title:
+        await query_cb.edit_message_text("Это предложение устарело — /follow <название>")
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    store.add(title, "anime")
+    await query_cb.edit_message_text(
+        f"🔔 Слежу за <b>{html.escape(title)}</b>.\n"
+        "Список — /following, отписаться — /unfollow",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_follow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    title = " ".join(context.args).strip() if context.args else ""
+    if not title:
+        await update.effective_message.reply_text(
+            "Что отслеживать: <code>/follow Табакошка</code>", parse_mode=ParseMode.HTML
+        )
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    added = store.add(title, "anime")
+    await update.effective_message.reply_text(
+        f"{'🔔 Слежу за' if added else 'Уже слежу за'} <b>{html.escape(title)}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_unfollow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    title = " ".join(context.args).strip() if context.args else ""
+    if not title:
+        shows = store.all()
+        if not shows:
+            await update.effective_message.reply_text("Ни за чем не слежу.")
+            return
+        rows = [
+            [InlineKeyboardButton(f"🔕 {s.title[:45]}", callback_data=f"unfollow:{i}")]
+            for i, s in enumerate(shows[:10])
+        ]
+        context.bot_data["unfollow_list"] = [s.title for s in shows[:10]]
+        await update.effective_message.reply_text(
+            "Отписаться от чего?", reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    removed = store.remove(title)
+    await update.effective_message.reply_text(
+        f"{'🔕 Больше не слежу за' if removed else 'И не следил за'} "
+        f"<b>{html.escape(title)}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def on_unfollow_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, index = query_cb.data.split(":", 1)
+    titles = context.bot_data.get("unfollow_list", [])
+    try:
+        title = titles[int(index)]
+    except (ValueError, IndexError):
+        await query_cb.edit_message_text("Список устарел — /unfollow ещё раз.")
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    store.remove(title)
+    await query_cb.edit_message_text(
+        f"🔕 Больше не слежу за <b>{html.escape(title)}</b>.", parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_following(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    shows = store.all()
+    if not shows:
+        await update.effective_message.reply_text(
+            "Ни за чем не слежу. Добавить: <code>/follow Название</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    lines = [
+        f"• {html.escape(s.title)}"
+        + (f"  <i>(проверено {s.last_checked[:10]})</i>" if s.last_checked else "")
+        for s in shows
+    ]
+    await update.effective_message.reply_text(
+        "🔔 <b>Слежу за</b>\n\n" + "\n".join(lines), parse_mode=ParseMode.HTML
+    )
+
+
+async def check_new_episodes(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Look for episodes of followed shows that haven't been offered yet.
+
+    Only ever proposes -- downloading automatically would mean picking a
+    release without you seeing it, which is the thing this whole setup exists
+    to avoid.
+    """
+    config: Config = context.bot_data["config"]
+    store: FollowStore = context.bot_data["follows"]
+    prowlarr: ProwlarrClient = context.bot_data["prowlarr"]
+
+    for show in store.all():
+        try:
+            names = await alternative_titles(show.title)
+            releases = await prowlarr.search_many(names)
+        except Exception:  # noqa: BLE001 - one bad show shouldn't stop the rest
+            log.exception("follow check failed for %s", show.title)
+            continue
+
+        fresh = [r for r in releases if r.title not in show.seen]
+        show.last_checked = datetime.now(timezone.utc).isoformat()
+
+        # Everything is new the first time round, which would mean dumping the
+        # show's entire back catalogue into the chat. Record it and only
+        # report what turns up after that.
+        if not show.seen:
+            for release in releases:
+                show.remember(release.title)
+            store.update(show)
+            continue
+
+        for release in releases:
+            show.remember(release.title)
+        store.update(show)
+
+        if not fresh:
+            continue
+
+        top = rank(fresh)[:5]
+        key = str(len(SEARCHES))
+        SEARCHES[key] = top
+        context.bot_data.setdefault("queries", {})[key] = show.title
+
+        await context.bot.send_message(
+            chat_id=config.chat_id,
+            message_thread_id=config.thread_id,
+            text=(
+                f"🆕 Новое по <b>{html.escape(show.title)}</b>\n\n"
+                + _results_text(show.title, top, 0)
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_results_keyboard(key, top, 0),
+            disable_web_page_preview=True,
+        )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -591,105 +796,7 @@ async def check_finished(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         if kind != "movies":
-            await _offer_sonarr(context, config, result.title, media_root)
-
-
-async def _offer_sonarr(
-    context: ContextTypes.DEFAULT_TYPE,
-    config: Config,
-    title: str,
-    media_root: str,
-) -> None:
-    """Propose registering the show in Sonarr, so Bazarr can fetch subtitles.
-
-    Deliberately a question rather than an automatic add: Sonarr looks titles
-    up in TheTVDB, and for a recent or oddly-named show the top hit can be a
-    completely unrelated series. Adding that silently would have Bazarr
-    downloading subtitles for the wrong programme, which is worse than having
-    none.
-    """
-    sonarr: SonarrClient | None = context.bot_data.get("sonarr")
-    if sonarr is None:
-        return
-
-    try:
-        matches = await sonarr.lookup(title, limit=3)
-        known = await sonarr.existing_tvdb_ids()
-    except Exception:  # noqa: BLE001
-        log.exception("sonarr lookup failed for %s", title)
-        return
-
-    matches = [m for m in matches if m.get("tvdbId") not in known]
-    if not matches:
-        return
-
-    key = f"{len(PENDING_SONARR)}:{title}"
-    PENDING_SONARR[key] = (matches, media_root)
-
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"✅ {m.get('title', '?')[:40]} ({m.get('year') or '?'})",
-                callback_data=f"sonarr:{key}:{i}",
-            )
-        ]
-        for i, m in enumerate(matches)
-    ]
-    rows.append([InlineKeyboardButton("✖️ не надо", callback_data=f"sonarr:{key}:x")])
-
-    await context.bot.send_message(
-        chat_id=config.chat_id,
-        message_thread_id=config.thread_id,
-        text=(
-            f"Добавить <b>{html.escape(title)}</b> в Sonarr?\n"
-            "Тогда подтянутся субтитры и новые серии будут качаться сами.\n\n"
-            "<i>Проверь, что это тот сериал:</i>"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-
-
-# Pending Sonarr confirmations, keyed per prompt. In memory only: if the bot
-# restarts before you answer, the show is still in the library and watchable
-# -- only the subtitle wiring is missed, and /sonarr can redo it.
-PENDING_SONARR: dict[str, tuple[list[dict[str, Any]], str]] = {}
-
-
-async def on_sonarr_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query_cb = update.callback_query
-    await query_cb.answer()
-
-    _, key, choice = query_cb.data.split(":", 2)
-    entry = PENDING_SONARR.pop(key, None)
-    if entry is None:
-        await query_cb.edit_message_text("Это предложение устарело.")
-        return
-
-    if choice == "x":
-        await query_cb.edit_message_text("Ок, не добавляю.")
-        return
-
-    matches, media_root = entry
-    series = matches[int(choice)]
-    config: Config = context.bot_data["config"]
-    sonarr: SonarrClient = context.bot_data["sonarr"]
-
-    try:
-        added = await sonarr.add_series(
-            series, media_root, config.sonarr_profile_id
-        )
-        await sonarr.rescan(added["id"])
-    except Exception as exc:  # noqa: BLE001
-        log.exception("failed to add series to sonarr")
-        await query_cb.edit_message_text(f"Не получилось добавить: {exc}")
-        return
-
-    await query_cb.edit_message_text(
-        f"✅ <b>{html.escape(series.get('title', '?'))}</b> добавлен в Sonarr.\n"
-        "Bazarr подтянет субтитры в течение нескольких минут.",
-        parse_mode=ParseMode.HTML,
-    )
+            await _offer_follow(context, config, result.title)
 
 
 def _kind_for(save_path: str, config: Config) -> str:
@@ -727,8 +834,7 @@ def main() -> None:
         app.bot_data["jellyfin"] = JellyfinClient(
             config.jellyfin_url, config.jellyfin_key
         )
-    if config.sonarr_url and config.sonarr_key:
-        app.bot_data["sonarr"] = SonarrClient(config.sonarr_url, config.sonarr_key)
+    app.bot_data["follows"] = FollowStore(Path(config.follow_state))
 
     # Only listen to the configured chat: the bot token is shared with the
     # infrastructure notifier, so it can be messaged from anywhere.
@@ -739,8 +845,12 @@ def main() -> None:
     app.add_handler(CommandHandler("search", cmd_search, filters=chat_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=chat_filter))
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=chat_filter))
+    app.add_handler(CommandHandler("follow", cmd_follow, filters=chat_filter))
+    app.add_handler(CommandHandler("unfollow", cmd_unfollow, filters=chat_filter))
+    app.add_handler(CommandHandler("following", cmd_following, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
-    app.add_handler(CallbackQueryHandler(on_sonarr_choice, pattern=r"^sonarr:"))
+    app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
+    app.add_handler(CallbackQueryHandler(on_unfollow_choice, pattern=r"^unfollow:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
@@ -753,6 +863,11 @@ def main() -> None:
     # lands while you're still looking at the chat, and cheap -- it's one
     # local API call against qBittorrent.
     app.job_queue.run_repeating(check_finished, interval=60, first=20)
+
+    # Followed shows, once a day. New episodes appear on a weekly schedule,
+    # so checking more often would mean five sweeps of every indexer for
+    # nothing -- and each sweep is one search per alternative title.
+    app.job_queue.run_repeating(check_new_episodes, interval=86400, first=300)
 
     app.run_polling(drop_pending_updates=True)
 
