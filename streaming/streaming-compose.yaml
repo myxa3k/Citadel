@@ -1,0 +1,166 @@
+name: streaming
+
+# Ports bind to 127.0.0.1 (local only) and ${TAILSCALE_IP} (tailnet) explicitly,
+# never 0.0.0.0 -- same rule as drive/. TAILSCALE_IP comes from .env.
+# Versions are pinned to the tags that were already running before this file
+# existed, captured from `docker inspect` -- not "latest".
+
+services:
+  streaming_flaresolverr:
+    image: flaresolverr/flaresolverr:v3.3.21
+    container_name: streaming_flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Europe/Oslo
+    ports:
+      - "127.0.0.1:8191:8191"
+      - "${TAILSCALE_IP}:8191:8191"
+    restart: unless-stopped
+
+  streaming_prowlarr:
+    image: lscr.io/linuxserver/prowlarr:2.4.0.5397-ls150
+    container_name: streaming_prowlarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Oslo
+    volumes:
+      - ./prowlarr/config:/config
+    ports:
+      - "127.0.0.1:9696:9696"
+      - "${TAILSCALE_IP}:9696:9696"
+    restart: unless-stopped
+    depends_on:
+      - streaming_flaresolverr
+
+  streaming_sonarr:
+    image: lscr.io/linuxserver/sonarr:4.0.17.2952-ls314
+    container_name: streaming_sonarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Oslo
+    volumes:
+      - ./sonarr/config:/config
+      # Root of the RAID is mounted so Sonarr can hardlink between
+      # /data/downloads and /data/media instead of copying across filesystems.
+      - /mnt/storage:/data
+    ports:
+      - "127.0.0.1:8989:8989"
+      - "${TAILSCALE_IP}:8989:8989"
+    restart: unless-stopped
+
+  streaming_radarr:
+    image: lscr.io/linuxserver/radarr:6.2.1.10461-ls306
+    container_name: streaming_radarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Oslo
+    volumes:
+      - ./radarr/config:/config
+      - /mnt/storage:/data
+    ports:
+      - "127.0.0.1:7878:7878"
+      - "${TAILSCALE_IP}:7878:7878"
+    restart: unless-stopped
+
+  streaming_qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:5.2.2_v2.0.13-ls462
+    container_name: streaming_qbittorrent
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Oslo
+      - WEBUI_PORT=8080
+    volumes:
+      - ./qbittorrent/config:/config
+      - /mnt/storage:/data
+    ports:
+      - "127.0.0.1:8090:8080"
+      - "${TAILSCALE_IP}:8090:8080"
+      # BitTorrent peer port needs to stay reachable from the internet for
+      # incoming connections -- this one is deliberately not tailnet-only.
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+    restart: unless-stopped
+
+  streaming_jellyfin:
+    image: jellyfin/jellyfin:10.11.11
+    container_name: streaming_jellyfin
+    user: "1000:1000"
+    environment:
+      - TZ=Europe/Oslo
+    volumes:
+      - ./jellyfin/config:/config
+      - ./jellyfin/cache:/cache
+      - /mnt/storage/media:/media
+    ports:
+      - "127.0.0.1:8096:8096"
+      - "${TAILSCALE_IP}:8096:8096"
+      - "127.0.0.1:7359:7359/udp"
+      - "${TAILSCALE_IP}:7359:7359/udp"
+    restart: unless-stopped
+
+  # The way downloads actually get started: you message it a title in any
+  # language, it searches every indexer through Prowlarr and lets you pick the
+  # release yourself. Sonarr/Radarr only ever search the English title their
+  # metadata provider hands them, which is why Russian releases never surfaced.
+  streaming_bot:
+    build: ./telegram-bot
+    container_name: streaming_bot
+    env_file:
+      - ./telegram-bot/.env
+    restart: unless-stopped
+    depends_on:
+      - streaming_prowlarr
+      - streaming_qbittorrent
+
+  # Subtitles. Watches what Sonarr/Radarr import and fetches Russian and
+  # English subs for it, so a release without embedded subs is still watchable.
+  streaming_bazarr:
+    image: lscr.io/linuxserver/bazarr:v1.6.2-ls366
+    container_name: streaming_bazarr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Europe/Oslo
+    volumes:
+      - ./bazarr/config:/config
+      # Same /data mount as Sonarr/Radarr so Bazarr sees identical paths.
+      - /mnt/storage:/data
+    ports:
+      - "127.0.0.1:6767:6767"
+      - "${TAILSCALE_IP}:6767:6767"
+    restart: unless-stopped
+
+  # Manual uploads: drop a file here from a phone or PC when the automatic
+  # search comes up empty. Deliberately separate from ownCloud on the drive VM
+  # -- nothing here is backed up, and no account has to be created per person.
+  streaming_filebrowser:
+    image: filebrowser/filebrowser:v2.32.0
+    container_name: streaming_filebrowser
+    user: "1000:1000"
+    environment:
+      - TZ=Europe/Oslo
+    volumes:
+      - /mnt/storage/manual-import:/srv
+      - ./filebrowser/database.db:/database.db
+      - ./filebrowser/settings.json:/config/settings.json
+    ports:
+      - "127.0.0.1:8081:80"
+      - "${TAILSCALE_IP}:8081:80"
+    restart: unless-stopped
+
+  streaming_seerr:
+    image: ghcr.io/seerr-team/seerr:v3.3.0
+    container_name: streaming_seerr
+    user: "1000:1000"
+    environment:
+      - TZ=Europe/Oslo
+    volumes:
+      - ./seerr/config:/app/config
+    ports:
+      - "127.0.0.1:5055:5055"
+      - "${TAILSCALE_IP}:5055:5055"
+    restart: unless-stopped

@@ -1,0 +1,19 @@
+# --- Secrets -----------------------------------------------------------------
+# Only *.env.example ever gets committed. Real .env files — never.
+.env
+*.env
+!*.env.example
+
+# --- Service data --------------------------------------------------------------
+# Per-service config directories hold API keys, sessions, and local databases
+# (Sonarr/Radarr/Prowlarr SQLite, qBittorrent session, Jellyfin library cache).
+# None of this belongs in git — it's instance state, not configuration.
+*/config/
+jellyfin/cache/
+
+# --- Junk ----------------------------------------------------------------------
+*.log
+*.partial
+*.bak
+*.swp
+.DS_Store
