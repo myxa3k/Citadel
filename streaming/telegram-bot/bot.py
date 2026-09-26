@@ -30,7 +30,6 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ParseMode
@@ -135,35 +134,30 @@ class Config:
 SEARCHES: dict[str, list[Scored]] = {}
 
 
-# Button captions double as the text they send, so the handlers match on
-# these exact strings.
-BTN_STATUS = "📥 Status"
-BTN_NEW = "🆕 New"
-BTN_FOLLOWING = "🔔 Following"
-BTN_LIBRARY = "📚 Library"
-BTN_DISK = "💾 Disk"
-BTN_HELP = "❔ Help"
+def _main_keyboard() -> InlineKeyboardMarkup:
+    """The control panel, attached underneath the bot's own messages.
 
-BUTTON_TEXTS = {BTN_STATUS, BTN_NEW, BTN_FOLLOWING, BTN_LIBRARY, BTN_DISK, BTN_HELP}
-
-
-def _main_keyboard() -> ReplyKeyboardMarkup:
-    """The persistent button panel under the message box.
-
-    Telegram has no general-purpose remote control, but a reply keyboard is
-    close: the buttons stay put and each one sends its own text, so common
-    actions never need a command typed out. Searching still does, because it
-    takes an argument -- a button cannot carry one.
+    A reply keyboard would be the obvious choice, but in a group Telegram
+    collapses it into an icon beside the message box instead of pinning it
+    under the chat -- so in a forum topic it isn't the visible panel it is in
+    a private chat. Inline buttons render identically everywhere and stay
+    clickable in the history, which is what actually makes this usable here.
     """
-    return ReplyKeyboardMarkup(
+    return InlineKeyboardMarkup(
         [
-            [BTN_STATUS, BTN_NEW],
-            [BTN_FOLLOWING, BTN_LIBRARY],
-            [BTN_DISK, BTN_HELP],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Type a title to search",
+            [
+                InlineKeyboardButton("📥 Status", callback_data="do:status"),
+                InlineKeyboardButton("🆕 New", callback_data="do:new"),
+            ],
+            [
+                InlineKeyboardButton("🔔 Following", callback_data="do:following"),
+                InlineKeyboardButton("📚 Library", callback_data="do:library"),
+            ],
+            [
+                InlineKeyboardButton("💾 Disk", callback_data="do:disk"),
+                InlineKeyboardButton("❔ Help", callback_data="do:help"),
+            ],
+        ]
     )
 
 
@@ -898,19 +892,26 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query_cb.edit_message_text("❌ Cancelled and removed.")
 
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A tap on the persistent keyboard, which arrives as ordinary text."""
-    text = (update.effective_message.text or "").strip()
+async def on_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A tap on the control panel."""
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, action = query_cb.data.split(":", 1)
     handler = {
-        BTN_STATUS: cmd_status,
-        BTN_NEW: cmd_new,
-        BTN_FOLLOWING: cmd_following,
-        BTN_LIBRARY: cmd_library,
-        BTN_DISK: cmd_disk,
-        BTN_HELP: cmd_start,
-    }.get(text)
-    if handler is not None:
-        await handler(update, context)
+        "status": cmd_status,
+        "new": cmd_new,
+        "following": cmd_following,
+        "library": cmd_library,
+        "disk": cmd_disk,
+        "help": cmd_start,
+    }.get(action)
+    if handler is None:
+        return
+
+    # The handlers reply to a message; a callback has one behind it (the
+    # bot's own), and replying there keeps the answer in the same topic.
+    await handler(update, context)
 
 
 async def on_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1246,14 +1247,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
-    app.add_handler(
-        # Keyboard taps arrive as plain text, so they must be matched before
-        # the catch-all search handler -- otherwise pressing "📥 Status"
-        # searches the trackers for a release called "📥 Status".
-        MessageHandler(
-            filters.TEXT & filters.Text(BUTTON_TEXTS) & chat_filter, on_button
-        )
-    )
+    app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^do:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, on_search)
     )
