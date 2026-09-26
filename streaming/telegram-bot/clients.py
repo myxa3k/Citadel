@@ -186,8 +186,8 @@ class QBittorrentClient:
                 return
 
         raise TorrentNotAdded(
-            "qBittorrent приняло запрос, но торрент не появился — "
-            "скорее всего он уже скачан под другим названием"
+            "qBittorrent accepted the request but no torrent appeared — "
+            "it is most likely already downloaded under another name"
         )
 
     async def delete(self, torrent_hash: str, delete_files: bool = True) -> None:

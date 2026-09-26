@@ -147,6 +147,29 @@ recognisable number is still linked, just unrenamed, rather than dropped.
 Re-running is safe: files already present are skipped, so nothing is
 duplicated if the job runs again over the same torrent.
 
+## Managing what's on the server
+
+`/library` lists every show with its file count and size, grouped by kind.
+`/disk` shows free space and how much the seeding torrents account for.
+
+`/delete` removes a show properly: the library files **and** the torrent it
+came from. Both matter — the library files are hardlinks to the download, so
+deleting only one side frees nothing. It takes a second confirming press,
+being the one irreversible action here.
+
+Deleting a show in Jellyfin instead also removes the library files (if the
+library permits it) but leaves the torrent seeding, so the space stays used.
+Prefer `/delete`.
+
+## The keyboard
+
+A persistent button panel sits under the message box for the things that take
+no argument — status, new episodes, following, library, disk, help. Searching
+still needs typing, since a button can't carry a title.
+
+The `/` menu beside the message box lists every command with a description;
+Telegram keeps it in sync, which a pinned message wouldn't.
+
 ## Manual uploads
 
 `http://<tailscale-ip>:8081` — drag a file in, it lands in

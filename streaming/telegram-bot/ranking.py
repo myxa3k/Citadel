@@ -58,18 +58,18 @@ def score(release: Release) -> Scored:
 
     if RE_JUNK.search(title):
         points -= 10_000
-        labels.append("⚠️ не видео")
+        labels.append("⚠️ not video")
 
     if RE_RU_DUB.search(title):
         points += 200
-        labels.append("🇷🇺 озвучка")
+        labels.append("🇷🇺 RU dub")
     if RE_CYRILLIC.search(title):
         points += 150
-        if "🇷🇺 озвучка" not in labels:
-            labels.append("🇷🇺 рус")
+        if "🇷🇺 RU dub" not in labels:
+            labels.append("🇷🇺 RU")
     if RE_RU_SUB.search(title):
         points += 120
-        labels.append("💬 рус.суб")
+        labels.append("💬 RU subs")
     if RE_DUAL.search(title):
         points += 60
         labels.append("🎧 dual")
@@ -80,7 +80,7 @@ def score(release: Release) -> Scored:
     # cancel it out rather than banning them outright.
     if RE_UKRAINIAN.search(title):
         points -= 180
-        labels.append("🇺🇦 укр")
+        labels.append("🇺🇦 UA")
 
     if RE_2160.search(title):
         points += 40
@@ -103,10 +103,10 @@ def score(release: Release) -> Scored:
     # sitting mid-list looking like a reasonable pick.
     if release.seeders == 0:
         points -= 500
-        labels.append("💀 нет сидов")
+        labels.append("💀 no seeds")
     elif release.seeders <= 2:
         points -= 100
-        labels.append("⚠️ мало сидов")
+        labels.append("⚠️ few seeds")
 
     return Scored(release=release, score=points, labels=labels)
 
