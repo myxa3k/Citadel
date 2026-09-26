@@ -447,6 +447,24 @@ Sources that sound like they should help, and don't:
 So Bazarr is worth having for live-action and for English subtitles, but for
 anime the release choice does the work.
 
+### Trackers the bot can't search
+
+Prowlarr can't reach every tracker — RuTracker refuses this host's
+datacentre IP at login, and no amount of FlareSolverr gets past it, so it
+isn't configured at all. Its releases are still reachable by hand:
+
+- **Send the `.torrent` file to the chat**, or
+- **Paste the magnet link** as a message
+
+Either way the bot asks which folder it belongs in and hands it to
+qBittorrent. From there it behaves like anything else — imported into the
+library, Jellyfin refreshed, "ready" posted to the topic.
+
+Worth checking the release description first: the RuTracker entry for
+Yuru Yuri's first season, for instance, ships Russian subtitles as separate
+`.ass` files. Those can be sent to the bot too, which is often quicker than
+fetching a 76 GB remux for the subtitles alone.
+
 ### When no Russian release exists
 
 Some shows only have English releases — Yuru Yuri's first season is one.

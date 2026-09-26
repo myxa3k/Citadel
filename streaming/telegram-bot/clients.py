@@ -161,21 +161,45 @@ class QBittorrentClient:
         Trusting the status code means telling the user a download started
         when nothing did.
         """
-        client = await self._session()
         data = {"urls": url, "category": category}
         if savepath:
             data["savepath"] = savepath
+        await self._submit(data)
 
+    async def add_file(
+        self,
+        content: bytes,
+        filename: str,
+        category: str,
+        savepath: str | None = None,
+    ) -> None:
+        """Add a .torrent file directly.
+
+        Needed for releases on trackers Prowlarr can't reach -- RuTracker
+        refuses this host's datacentre IP at login, so its torrents can only
+        arrive as a file fetched by hand.
+        """
+        data = {"category": category}
+        if savepath:
+            data["savepath"] = savepath
+        await self._submit(
+            data, files={"torrents": (filename, content, "application/x-bittorrent")}
+        )
+
+    async def _submit(
+        self, data: dict[str, str], files: dict[str, Any] | None = None
+    ) -> None:
+        """POST to /torrents/add and confirm the torrent actually arrived."""
+        client = await self._session()
         before = {t.get("hash") for t in await self.torrents()}
 
-        resp = await client.post(urljoin(self._base, "api/v2/torrents/add"), data=data)
+        endpoint = urljoin(self._base, "api/v2/torrents/add")
+        resp = await client.post(endpoint, data=data, files=files)
         # A session that outlived its cookie comes back as 403; log in again
         # and retry once before giving up.
         if resp.status_code == 403:
             await self._login(client)
-            resp = await client.post(
-                urljoin(self._base, "api/v2/torrents/add"), data=data
-            )
+            resp = await client.post(endpoint, data=data, files=files)
         resp.raise_for_status()
 
         # Adding is asynchronous -- the torrent appears a moment later, so

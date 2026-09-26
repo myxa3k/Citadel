@@ -19,6 +19,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from telegram import (
     BotCommand,
@@ -224,10 +226,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/delete — remove a show and its torrent\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
-        "<b>Subtitles</b>\n"
-        "Send me an .ass/.srt file (or a .zip of them) and pick the show — "
-        "I'll match them to episodes and put them in place. For when a show "
-        "has no Russian release and you found subtitles yourself.\n\n"
+        "<b>Sending me files</b>\n"
+        "• a <b>.torrent</b> or a <b>magnet link</b> — I'll download it. "
+        "Use this for trackers I can't search myself, like RuTracker.\n"
+        "• an <b>.ass/.srt</b> file, or a <b>.zip</b> of them — pick the show "
+        "and I'll match them to episodes. For when a show has no Russian "
+        "release and you found subtitles yourself.\n\n"
         "🌱 is how many people are sharing. Zero means it will never "
         "download, however long you wait.",
         parse_mode=ParseMode.HTML,
@@ -828,6 +832,14 @@ async def on_subtitle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     name = (document.file_name or "").lower()
+
+    # A .torrent goes straight to qBittorrent -- that is the way to grab a
+    # release from a tracker Prowlarr can't reach, RuTracker being the one
+    # that matters here.
+    if name.endswith(".torrent"):
+        await _add_torrent_file(update, context, document)
+        return
+
     is_archive = name.endswith(".zip")
     if not is_archive and Path(name).suffix not in SUBTITLE_SUFFIXES:
         return
@@ -881,6 +893,76 @@ async def on_subtitle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         f"Got <b>{len(found)}</b> subtitle file(s).\n\nWhich show are they for?",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _add_torrent_file(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, document: Any
+) -> None:
+    """Take a .torrent sent to the chat and ask which folder it belongs in."""
+    status = await update.effective_message.reply_text("📥 Reading torrent…")
+
+    try:
+        handle = await document.get_file()
+        content = bytes(await handle.download_as_bytearray())
+    except Exception as exc:  # noqa: BLE001
+        log.exception("could not download torrent file")
+        await status.edit_text(f"Could not read that file: {exc}")
+        return
+
+    key = str(status.message_id)
+    context.bot_data.setdefault("pending_torrents", {})[key] = (
+        content,
+        document.file_name or "upload.torrent",
+    )
+
+    await status.edit_text(
+        f"<b>{html.escape(document.file_name or 'torrent')}</b>\n\nWhere should it go?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🎌 Anime", callback_data=f"tor:{key}:anime"),
+                    InlineKeyboardButton("📺 TV", callback_data=f"tor:{key}:series"),
+                    InlineKeyboardButton("🎬 Film", callback_data=f"tor:{key}:movies"),
+                ]
+            ]
+        ),
+    )
+
+
+async def on_torrent_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, key, kind = query_cb.data.split(":", 2)
+    pending = context.bot_data.get("pending_torrents", {}).pop(key, None)
+    if pending is None:
+        await query_cb.edit_message_text("That upload has expired — send it again.")
+        return
+
+    content, filename = pending
+    config: Config = context.bot_data["config"]
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    savepath = config.save_paths.get(kind)
+
+    try:
+        await qbit.add_file(content, filename, category=CATEGORY, savepath=savepath)
+    except TorrentNotAdded:
+        await query_cb.edit_message_text(
+            "ℹ️ Already downloaded — this release is here under another name.\n"
+            "Check /status or watch it in Jellyfin."
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.exception("could not add torrent file")
+        await query_cb.edit_message_text(f"Could not queue it: {exc}")
+        return
+
+    await query_cb.edit_message_text(
+        f"✅ Queued\n\n<b>{html.escape(filename)}</b>\n"
+        f"📁 {html.escape(savepath or '?')}\n\nProgress — /status",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1233,7 +1315,79 @@ async def on_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = (update.effective_message.text or "").strip()
     if not query:
         return
+    # A pasted magnet link is an instruction, not something to search for.
+    if query.startswith("magnet:?"):
+        await _add_magnet(update, context, query)
+        return
     await _do_search(update, context, query)
+
+
+async def _add_magnet(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, link: str
+) -> None:
+    """Queue a pasted magnet link, asking which folder it belongs in."""
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    # Magnets carry the release name in dn=, which is worth showing back so
+    # it's clear what is about to download.
+    match = re.search(r"[&?]dn=([^&]+)", link)
+    name = unquote(match.group(1)) if match else "magnet link"
+
+    status = await update.effective_message.reply_text(
+        f"<b>{html.escape(name[:120])}</b>\n\nWhere should it go?",
+        parse_mode=ParseMode.HTML,
+    )
+
+    key = str(status.message_id)
+    context.bot_data.setdefault("pending_magnets", {})[key] = link
+
+    await status.edit_text(
+        f"<b>{html.escape(name[:120])}</b>\n\nWhere should it go?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🎌 Anime", callback_data=f"mag:{key}:anime"),
+                    InlineKeyboardButton("📺 TV", callback_data=f"mag:{key}:series"),
+                    InlineKeyboardButton("🎬 Film", callback_data=f"mag:{key}:movies"),
+                ]
+            ]
+        ),
+    )
+
+
+async def on_magnet_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, key, kind = query_cb.data.split(":", 2)
+    link = context.bot_data.get("pending_magnets", {}).pop(key, None)
+    if link is None:
+        await query_cb.edit_message_text("That link has expired — paste it again.")
+        return
+
+    config: Config = context.bot_data["config"]
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    savepath = config.save_paths.get(kind)
+
+    try:
+        await qbit.add(link, category=CATEGORY, savepath=savepath)
+    except TorrentNotAdded:
+        await query_cb.edit_message_text(
+            "ℹ️ Already downloaded — this release is here under another name."
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.exception("could not add magnet")
+        await query_cb.edit_message_text(f"Could not queue it: {exc}")
+        return
+
+    await query_cb.edit_message_text(
+        f"✅ Queued\n📁 {html.escape(savepath or '?')}\n\nProgress — /status",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def _do_search(
@@ -1562,6 +1716,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
     app.add_handler(CallbackQueryHandler(on_subtitle_target, pattern=r"^subs:"))
+    app.add_handler(CallbackQueryHandler(on_torrent_target, pattern=r"^tor:"))
+    app.add_handler(CallbackQueryHandler(on_magnet_target, pattern=r"^mag:"))
     app.add_handler(
         MessageHandler(filters.Document.ALL & chat_filter, on_subtitle_file)
     )
