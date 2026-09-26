@@ -132,6 +132,23 @@ class QBittorrentClient:
             )
         resp.raise_for_status()
 
+    async def delete(self, torrent_hash: str, delete_files: bool = True) -> None:
+        """Drop a torrent. `delete_files` is on by default because the only
+        reason to cancel is that the download is going nowhere -- leaving a
+        part-file behind would just waste the disk."""
+        client = await self._session()
+        data = {
+            "hashes": torrent_hash,
+            "deleteFiles": "true" if delete_files else "false",
+        }
+        resp = await client.post(urljoin(self._base, "api/v2/torrents/delete"), data=data)
+        if resp.status_code == 403:
+            await self._login(client)
+            resp = await client.post(
+                urljoin(self._base, "api/v2/torrents/delete"), data=data
+            )
+        resp.raise_for_status()
+
     async def torrents(self, category: str | None = None) -> list[dict[str, Any]]:
         client = await self._session()
         params = {"category": category} if category else {}

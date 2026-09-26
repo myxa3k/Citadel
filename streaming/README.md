@@ -58,7 +58,19 @@ In the Citadel group's **Streaming** topic:
 The bot searches every indexer at once, ranks what comes back (Russian audio
 and subtitles first, non-video junk last), and shows it as buttons. Pick a
 release, pick where it goes, and it's handed to qBittorrent. `/status` shows
-what's currently downloading.
+what's currently downloading; `/cancel` drops one that isn't going anywhere.
+
+**Seeders decide whether a download is possible at all**, so ranking weighs
+them heavily at the bottom end: zero seeders costs 500 points and gets a
+`💀 нет сидов` label, one or two costs 100. A perfectly-labelled Russian
+release nobody is sharing is worse than an English one that actually
+arrives, and without this it would sit mid-list looking like a sane pick —
+which is exactly how the first real download stalled at 0% indefinitely.
+
+`/status` says what a torrent is actually doing rather than repeating
+qBittorrent's state name: `💀 нет раздающих` when the swarm is empty (it will
+never finish — cancel it), `⏳ ищу пиров` when seeders exist but aren't
+connected yet (usually resolves itself).
 
 **Search by the name the tracker uses.** Russian trackers list
 «Синий экзорцист», not "Blue Exorcist" — the bot passes the query through

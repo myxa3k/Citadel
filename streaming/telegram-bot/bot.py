@@ -188,7 +188,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Команды:\n"
         "/search &lt;название&gt; — искать\n"
         "/status — что сейчас качается\n"
-        "/help — эта справка",
+        "/cancel — отменить загрузку\n"
+        "/help — эта справка\n\n"
+        "🌱 в списке — сколько человек раздаёт. Ноль означает, что "
+        "скачать не получится, сколько ни жди.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -211,20 +214,53 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     lines = []
+    stuck = False
     for t in torrents[:15]:
         pct = (t.get("progress") or 0) * 100
         speed = (t.get("dlspeed") or 0) / (1024**2)
-        state = t.get("state", "?")
+        seeds = t.get("num_seeds") or 0
+        swarm_seeds = t.get("num_complete") or 0
         eta = t.get("eta") or 0
-        eta_txt = f"{eta // 60} мин" if 0 < eta < 8640000 else "—"
-        lines.append(
-            f"• {html.escape((t.get('name') or '?')[:60])}\n"
-            f"   {pct:.1f}%  •  {speed:.1f} MB/s  •  {html.escape(state)}  •  ⏱ {eta_txt}"
+        name = html.escape((t.get("name") or "?")[:60])
+        state, detail = _describe(t, seeds, swarm_seeds, speed, eta)
+        if "💀" in state:
+            stuck = True
+        lines.append(f"• {name}\n   {pct:.1f}%  •  {state}{detail}")
+
+    text = "📥 <b>Загрузки</b>\n\n" + "\n".join(lines)
+    if stuck:
+        # Otherwise a dead torrent just sits at 0% forever with no explanation
+        # of why, which looks identical to "still starting up".
+        text += (
+            "\n\n💀 — раздачу никто не раздаёт, скачать её нельзя.\n"
+            "Отменить: /cancel — и выбери другой релиз, с сидами."
         )
 
-    await update.effective_message.reply_text(
-        "📥 <b>Загрузки</b>\n\n" + "\n".join(lines), parse_mode=ParseMode.HTML
-    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def _describe(
+    torrent: dict[str, Any], seeds: int, swarm_seeds: int, speed: float, eta: int
+) -> tuple[str, str]:
+    """Turn qBittorrent's state name into something worth reading."""
+    state = torrent.get("state", "")
+    progress = torrent.get("progress") or 0
+
+    if progress >= 1:
+        return "✅ готово", " • раздаётся" if state.endswith("UP") else ""
+    if state in {"pausedDL", "stoppedDL"}:
+        return "⏸ на паузе", ""
+    if state in {"metaDL", "checkingDL", "allocating"}:
+        return "⏳ подготовка", ""
+    if speed > 0:
+        eta_txt = f" • ⏱ {eta // 60} мин" if 0 < eta < 8640000 else ""
+        return f"⬇️ {speed:.1f} MB/s", f" • 🌱 {seeds}{eta_txt}"
+    # Not moving. Whether that's fatal depends on the swarm, not on us:
+    # no seeders anywhere means it can never finish, while seeders that
+    # exist but aren't connected yet usually resolve on their own.
+    if swarm_seeds == 0:
+        return "💀 нет раздающих", ""
+    return "⏳ ищу пиров", f" • 🌱 {swarm_seeds} в сети"
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,6 +274,57 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     await _do_search(update, context, query)
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show what's downloading with a button to drop each one."""
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    try:
+        torrents = await qbit.torrents(category=CATEGORY)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("cancel listing failed")
+        await update.effective_message.reply_text(f"qBittorrent не отвечает: {exc}")
+        return
+
+    # A finished torrent is seeding, not downloading -- cancelling it would
+    # mean deleting something already watchable, which isn't what /cancel is.
+    pending = [t for t in torrents if (t.get("progress") or 0) < 1]
+    if not pending:
+        await update.effective_message.reply_text("Нечего отменять — всё скачано.")
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"❌ {(t.get('name') or '?')[:45]}",
+                callback_data=f"del:{t.get('hash')}",
+            )
+        ]
+        for t in pending[:8]
+    ]
+    await update.effective_message.reply_text(
+        "Что отменить?", reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, torrent_hash = query_cb.data.split(":", 1)
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    try:
+        await qbit.delete(torrent_hash, delete_files=True)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("delete failed")
+        await query_cb.edit_message_text(f"Не удалось отменить: {exc}")
+        return
+
+    await query_cb.edit_message_text("❌ Отменено и удалено.")
 
 
 async def on_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -504,6 +591,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_start, filters=chat_filter))
     app.add_handler(CommandHandler("search", cmd_search, filters=chat_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=chat_filter))
+    app.add_handler(CommandHandler("cancel", cmd_cancel, filters=chat_filter))
+    app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))

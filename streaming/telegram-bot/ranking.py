@@ -97,6 +97,17 @@ def score(release: Release) -> Scored:
     # Russian one that has fewer peers.
     points += min(release.seeders, 50)
 
+    # Below a couple of seeders the download realistically won't finish --
+    # a perfectly-labelled Russian release with nobody sharing it is worse
+    # than an English one that actually arrives, so it sinks rather than
+    # sitting mid-list looking like a reasonable pick.
+    if release.seeders == 0:
+        points -= 500
+        labels.append("💀 нет сидов")
+    elif release.seeders <= 2:
+        points -= 100
+        labels.append("⚠️ мало сидов")
+
     return Scored(release=release, score=points, labels=labels)
 
 
