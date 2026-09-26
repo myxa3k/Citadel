@@ -223,6 +223,14 @@ came from. Both matter — the library files are hardlinks to the download, so
 deleting only one side frees nothing. It takes a second confirming press,
 being the one irreversible action here.
 
+`/cleanup` handles a different case: downloads that **no torrent owns any
+more**. They appear when a torrent is removed from qBittorrent without its
+data, or from before this bot existed at all. Nothing tracks them, so they
+are invisible to `/delete`, absent from `/disk`'s seeding figure, and they
+quietly hold the disk — on this server they had accumulated to 223 GB of a
+503 GB volume. The command lists what it found with sizes, and deletes only
+after you confirm. Anything a torrent is still seeding is never touched.
+
 Deleting a show in Jellyfin instead also removes the library files (if the
 library permits it) but leaves the torrent seeding, so the space stays used.
 Prefer `/delete`.

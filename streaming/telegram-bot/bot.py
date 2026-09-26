@@ -215,7 +215,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Library</b>\n"
         "/library — what's on the server\n"
         "/delete — remove a show and its torrent\n"
-        "/disk — free space\n\n"
+        "/disk — free space\n"
+        "/cleanup — delete downloads no torrent owns\n\n"
         "🌱 is how many people are sharing. Zero means it will never "
         "download, however long you wait.",
         parse_mode=ParseMode.HTML,
@@ -688,6 +689,136 @@ async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _orphans(download_roots: list[str], managed: set[str]) -> list[tuple[Path, int]]:
+    """Files under the download folders that no torrent accounts for.
+
+    These appear when a torrent is removed without its data -- from the
+    qBittorrent UI, or because it predates this bot entirely. Nothing tracks
+    them afterwards, so they sit there consuming the disk while /disk reports
+    only what is actually seeding.
+    """
+    # A torrent's content_path is the file or folder it owns. Reduce each to
+    # its top-level entry under the download root, since that is the unit
+    # that would be deleted.
+    protected: set[str] = set()
+    for path in managed:
+        for root in download_roots:
+            if path.startswith(root.rstrip("/") + "/"):
+                rest = path[len(root.rstrip("/")) + 1 :]
+                protected.add(rest.split("/", 1)[0])
+
+    found: list[tuple[Path, int]] = []
+    for root in download_roots:
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        for entry in base.iterdir():
+            if entry.name in protected:
+                continue
+            # The per-category folders are ours and are meant to be empty.
+            if entry.is_dir() and not any(entry.iterdir()):
+                continue
+            size = (
+                sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+                if entry.is_dir()
+                else entry.stat().st_size
+            )
+            found.append((entry, size))
+
+    return sorted(found, key=lambda item: -item[1])
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Find downloads no torrent is responsible for any more."""
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    try:
+        managed = await qbit.managed_paths()
+    except Exception as exc:  # noqa: BLE001
+        log.exception("cleanup listing failed")
+        await update.effective_message.reply_text(
+            f"qBittorrent is not responding: {exc}"
+        )
+        return
+
+    roots = list(dict.fromkeys(config.save_paths.values()))
+    # Also scan the parent, since anything downloaded before the per-category
+    # folders existed sits directly in downloads/.
+    roots += [str(Path(r).parent) for r in roots]
+    roots = list(dict.fromkeys(roots))
+
+    orphans = await asyncio.to_thread(_orphans, roots, managed)
+    if not orphans:
+        await update.effective_message.reply_text(
+            "Nothing to clean up — every download belongs to a torrent."
+        )
+        return
+
+    total = sum(size for _, size in orphans)
+    context.bot_data["cleanup_list"] = orphans
+
+    preview = "\n".join(
+        f"  • {html.escape(path.name[:46])} — {_human(size)}"
+        for path, size in orphans[:8]
+    )
+    more = f"\n  …and {len(orphans) - 8} more" if len(orphans) > 8 else ""
+
+    await update.effective_message.reply_text(
+        f"🧹 <b>{len(orphans)} orphaned downloads</b> — {_human(total)}\n\n"
+        "No torrent is seeding these; they are left over from torrents "
+        "removed without their files.\n\n"
+        f"{preview}{more}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🗑 Delete all ({_human(total)})", callback_data="cleanup:yes"
+                    )
+                ],
+                [InlineKeyboardButton("✖️ Keep", callback_data="cleanup:no")],
+            ]
+        ),
+    )
+
+
+async def on_cleanup_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    if query_cb.data == "cleanup:no":
+        await query_cb.edit_message_text("Kept.")
+        return
+
+    orphans = context.bot_data.pop("cleanup_list", None)
+    if not orphans:
+        await query_cb.edit_message_text("That list has expired — run /cleanup again.")
+        return
+
+    await query_cb.edit_message_text("🧹 Deleting…")
+
+    freed = 0
+    failed = 0
+    for path, size in orphans:
+        try:
+            if path.is_dir():
+                await asyncio.to_thread(shutil.rmtree, path)
+            else:
+                await asyncio.to_thread(path.unlink)
+            freed += size
+        except OSError:
+            log.exception("could not remove %s", path)
+            failed += 1
+
+    note = f"\n{failed} could not be removed — see the log." if failed else ""
+    await query_cb.edit_message_text(
+        f"🧹 Freed <b>{_human(freed)}</b>.{note}", parse_mode=ParseMode.HTML
+    )
+
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Remove a show: library files, the torrent, and the download."""
     config: Config = context.bot_data["config"]
@@ -1145,6 +1276,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("library", "What is on the server"),
             BotCommand("delete", "Remove a show and its torrent"),
             BotCommand("disk", "Free space"),
+            BotCommand("cleanup", "Delete downloads no torrent owns"),
             BotCommand("help", "How this works"),
         ]
     )
@@ -1186,12 +1318,14 @@ def main() -> None:
     app.add_handler(CommandHandler("library", cmd_library, filters=chat_filter))
     app.add_handler(CommandHandler("delete", cmd_delete, filters=chat_filter))
     app.add_handler(CommandHandler("disk", cmd_disk, filters=chat_filter))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
     app.add_handler(CallbackQueryHandler(on_unfollow_choice, pattern=r"^unfollow:"))
     app.add_handler(CallbackQueryHandler(on_new_choice, pattern=r"^new:"))
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
+    app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))

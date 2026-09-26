@@ -190,6 +190,20 @@ class QBittorrentClient:
             "it is most likely already downloaded under another name"
         )
 
+    async def managed_paths(self) -> set[str]:
+        """Every path qBittorrent currently owns, as reported by itself.
+
+        Used to tell apart files it is still seeding from ones left behind
+        when a torrent was removed without its data -- the latter are
+        invisible to both qBittorrent and this bot, and quietly fill the
+        disk.
+        """
+        return {
+            t["content_path"]
+            for t in await self.torrents()
+            if t.get("content_path")
+        }
+
     async def delete(self, torrent_hash: str, delete_files: bool = True) -> None:
         """Drop a torrent. `delete_files` is on by default because the only
         reason to cancel is that the download is going nowhere -- leaving a
