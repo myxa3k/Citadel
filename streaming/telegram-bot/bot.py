@@ -44,7 +44,7 @@ from clients import (
     Release,
     TorrentNotAdded,
 )
-from following import FollowStore
+from following import Followed, FollowStore
 from importer import import_download
 from ranking import Scored, rank
 from titles import alternative_titles
@@ -201,6 +201,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status — что сейчас качается\n"
         "/cancel — отменить загрузку\n"
         "/follow &lt;название&gt; — следить за новыми сериями\n"
+        "/new — что вышло у отслеживаемых\n"
         "/following — за чем слежу\n"
         "/unfollow — перестать следить\n"
         "/help — эта справка\n\n"
@@ -451,6 +452,7 @@ async def check_new_episodes(context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     store: FollowStore = context.bot_data["follows"]
     prowlarr: ProwlarrClient = context.bot_data["prowlarr"]
+    updated: list[Followed] = []
 
     for show in store.all():
         try:
@@ -463,38 +465,132 @@ async def check_new_episodes(context: ContextTypes.DEFAULT_TYPE) -> None:
         fresh = [r for r in releases if r.title not in show.seen]
         show.last_checked = datetime.now(timezone.utc).isoformat()
 
-        # Everything is new the first time round, which would mean dumping the
-        # show's entire back catalogue into the chat. Record it and only
+        # Everything looks new the first time round, which would announce a
+        # finished show's entire back catalogue. Record it silently and only
         # report what turns up after that.
-        if not show.seen:
-            for release in releases:
-                show.remember(release.title)
-            store.update(show)
-            continue
-
+        first_run = not show.seen
         for release in releases:
             show.remember(release.title)
+
+        if not first_run and fresh:
+            # Store the titles, not the releases: /new re-searches when you
+            # actually ask, so the download links are fresh rather than
+            # hours old and possibly expired.
+            for release in fresh:
+                if release.title not in show.pending:
+                    show.pending.append(release.title)
+            updated.append(show)
+
         store.update(show)
 
-        if not fresh:
-            continue
+    if not updated:
+        return
 
-        top = rank(fresh)[:5]
-        key = str(len(SEARCHES))
-        SEARCHES[key] = top
-        context.bot_data.setdefault("queries", {})[key] = show.title
+    # One short message naming the shows, not a wall of releases. Which
+    # release to take is decided later, in /new, when you're ready to choose.
+    lines = [f"• <b>{html.escape(s.title)}</b> — {len(s.pending)}" for s in updated]
+    await context.bot.send_message(
+        chat_id=config.chat_id,
+        message_thread_id=config.thread_id,
+        text=(
+            "🆕 <b>Вышло новое</b>\n\n"
+            + "\n".join(lines)
+            + "\n\nПосмотреть и скачать — /new"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
 
-        await context.bot.send_message(
-            chat_id=config.chat_id,
-            message_thread_id=config.thread_id,
-            text=(
-                f"🆕 Новое по <b>{html.escape(show.title)}</b>\n\n"
-                + _results_text(show.title, top, 0)
-            ),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_results_keyboard(key, top, 0),
-            disable_web_page_preview=True,
+
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows with episodes found since you last looked."""
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    waiting = [s for s in store.all() if s.has_news]
+    if not waiting:
+        await update.effective_message.reply_text(
+            "Ничего нового. Слежу за: /following"
         )
+        return
+
+    context.bot_data["new_list"] = [s.title for s in waiting]
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{s.title[:38]} ({len(s.pending)})", callback_data=f"new:{i}"
+            )
+        ]
+        for i, s in enumerate(waiting[:10])
+    ]
+    await update.effective_message.reply_text(
+        "🆕 <b>Есть новое</b>\n\nВыбери, что посмотреть:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_new_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, index = query_cb.data.split(":", 1)
+    titles = context.bot_data.get("new_list", [])
+    try:
+        title = titles[int(index)]
+    except (ValueError, IndexError):
+        await query_cb.edit_message_text("Список устарел — /new ещё раз.")
+        return
+
+    store: FollowStore = context.bot_data["follows"]
+    show = next((s for s in store.all() if s.title == title), None)
+    if show is None or not show.pending:
+        await query_cb.edit_message_text("По этому тайтлу уже ничего нового.")
+        return
+
+    await query_cb.edit_message_text(f"🔍 Ищу новое по «{html.escape(title)}»…",
+                                     parse_mode=ParseMode.HTML)
+
+    # Search again rather than replaying what the daily check found: those
+    # results are hours old, and Prowlarr's download links are signed per
+    # request, so a stored one may no longer work.
+    prowlarr: ProwlarrClient = context.bot_data["prowlarr"]
+    try:
+        releases = await prowlarr.search_many(await alternative_titles(title))
+    except Exception as exc:  # noqa: BLE001
+        log.exception("re-search failed for %s", title)
+        await query_cb.edit_message_text(f"Поиск не удался: {exc}")
+        return
+
+    wanted = {t for t in show.pending}
+    fresh = [r for r in releases if r.title in wanted]
+    if not fresh:
+        # The releases vanished between the daily check and now -- rare, but
+        # possible on a tracker that prunes. Don't leave them queued forever.
+        show.pending.clear()
+        store.update(show)
+        await query_cb.edit_message_text(
+            "Эти раздачи больше недоступны. Попробуй /search."
+        )
+        return
+
+    ranked = rank(fresh)
+    key = str(query_cb.message.message_id)
+    SEARCHES[key] = ranked
+    context.bot_data.setdefault("queries", {})[key] = title
+
+    # Clearing now means /new won't keep offering the same episodes. They're
+    # already in `seen`, so a later check won't re-announce them either.
+    show.pending.clear()
+    store.update(show)
+
+    await query_cb.edit_message_text(
+        _results_text(title, ranked, 0),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_results_keyboard(key, ranked, 0),
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -848,9 +944,11 @@ def main() -> None:
     app.add_handler(CommandHandler("follow", cmd_follow, filters=chat_filter))
     app.add_handler(CommandHandler("unfollow", cmd_unfollow, filters=chat_filter))
     app.add_handler(CommandHandler("following", cmd_following, filters=chat_filter))
+    app.add_handler(CommandHandler("new", cmd_new, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
     app.add_handler(CallbackQueryHandler(on_unfollow_choice, pattern=r"^unfollow:"))
+    app.add_handler(CallbackQueryHandler(on_new_choice, pattern=r"^new:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))

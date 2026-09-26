@@ -24,15 +24,23 @@ log = logging.getLogger(__name__)
 class Followed:
     title: str
     kind: str
-    # Release titles already offered, so the same episode isn't proposed
-    # every single day. Grows slowly and is capped when saving.
+    # Release titles already accounted for, so the same episode isn't
+    # announced every day. Grows slowly and is capped when saving.
     seen: list[str] = field(default_factory=list)
     last_checked: str | None = None
+    # Releases found since you last looked. Kept here rather than pushed
+    # straight to the chat: the notification only says *which* shows have
+    # something new, and /new is what shows the releases themselves.
+    pending: list[str] = field(default_factory=list)
 
     def remember(self, release_title: str, keep: int = 200) -> None:
         self.seen.append(release_title)
         if len(self.seen) > keep:
             del self.seen[:-keep]
+
+    @property
+    def has_news(self) -> bool:
+        return bool(self.pending)
 
 
 class FollowStore:

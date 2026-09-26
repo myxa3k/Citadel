@@ -75,13 +75,30 @@ connected yet (usually resolves itself).
 ## Following a show
 
 `/follow <name>` (or the button offered after an import) adds a show to a
-once-a-day check. New releases that haven't been offered before come back as
-the same list of buttons a search produces — it proposes, never downloads on
-its own, which is the point of the whole setup.
+once-a-day check. When something turns up, the notification is deliberately
+short — just which shows have new episodes and how many:
+
+```
+🆕 Вышло новое
+
+• Табакошка — 2
+• Youjo Senki II — 1
+
+Посмотреть и скачать — /new
+```
+
+`/new` then lists those shows as buttons; picking one re-runs the search and
+shows the actual releases to choose from, exactly like `/search`. Nothing is
+ever downloaded unattended.
+
+The re-search matters: the daily check stores release *titles*, not links.
+Prowlarr signs download URLs per request, so replaying one found hours
+earlier can fail — searching again gets a fresh link and current seeder
+counts.
 
 The first check records everything currently available without reporting it,
-otherwise following a finished show would dump its entire back catalogue into
-the chat. `/following` lists what's watched, `/unfollow` stops.
+otherwise following a finished show would announce its entire back catalogue.
+`/following` lists what's watched, `/unfollow` stops.
 
 The list lives in `telegram-bot/state/following.json`, mounted from the host
 so it survives an image rebuild. It's plain JSON and safe to edit by hand.
