@@ -134,9 +134,16 @@ arrives, and without this it would sit mid-list looking like a sane pick —
 which is exactly how the first real download stalled at 0% indefinitely.
 
 `/status` says what a torrent is actually doing rather than repeating
-qBittorrent's state name: `💀 нет раздающих` when the swarm is empty (it will
-never finish — cancel it), `⏳ ищу пиров` when seeders exist but aren't
+qBittorrent's state name: `💀 no seeders` when the swarm is empty (it will
+never finish — cancel it), `⏳ finding peers` when seeders exist but aren't
 connected yet (usually resolves itself).
+
+While anything is still downloading, that one message **keeps itself
+current** — it redraws every few seconds and stops once everything is done,
+so there's no need to keep asking. Editing is paced well under Telegram's
+rate limit, skipped entirely when the text hasn't changed (a stalled torrent
+renders identically every time, and Telegram rejects a no-op edit), and
+capped at half an hour so a forgotten message doesn't update all night.
 
 ## Following a show
 

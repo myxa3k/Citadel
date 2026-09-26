@@ -223,6 +223,49 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _status_text(torrents: list[dict[str, Any]]) -> tuple[str, bool]:
+    """Render the downloads list. Returns the text and whether any are active.
+
+    "Active" drives the live refresh: once nothing is moving there is nothing
+    left to redraw, so the updater stops rather than editing the same message
+    forever.
+    """
+    lines = []
+    stuck = False
+    active = False
+    for t in torrents[:15]:
+        pct = (t.get("progress") or 0) * 100
+        speed = (t.get("dlspeed") or 0) / (1024**2)
+        seeds = t.get("num_seeds") or 0
+        swarm_seeds = t.get("num_complete") or 0
+        eta = t.get("eta") or 0
+        name = html.escape((t.get("name") or "?")[:60])
+        state, detail = _describe(t, seeds, swarm_seeds, speed, eta)
+        if "💀" in state:
+            stuck = True
+        if (t.get("progress") or 0) < 1:
+            active = True
+        lines.append(f"• {name}\n   {pct:.1f}%  •  {state}{detail}")
+
+    text = "📥 <b>Downloads</b>\n\n" + "\n".join(lines)
+    if stuck:
+        # Otherwise a dead torrent just sits at 0% forever with no explanation
+        # of why, which looks identical to "still starting up".
+        text += (
+            "\n\n💀 — nobody is seeding this, it cannot be downloaded.\n"
+            "Cancel it with /cancel and pick a release that has seeders."
+        )
+    return text, active
+
+
+# How often the live status message redraws, and for how long. Telegram rate
+# limits edits to a message, so a few seconds apart is both enough to look
+# live and far from the limit. The cap stops a forgotten message editing
+# itself all night.
+STATUS_REFRESH_SECONDS = 5
+STATUS_MAX_MINUTES = 30
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = context.bot_data["config"]
     if not _authorised(config, update):
@@ -240,30 +283,59 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Nothing is downloading right now.")
         return
 
-    lines = []
-    stuck = False
-    for t in torrents[:15]:
-        pct = (t.get("progress") or 0) * 100
-        speed = (t.get("dlspeed") or 0) / (1024**2)
-        seeds = t.get("num_seeds") or 0
-        swarm_seeds = t.get("num_complete") or 0
-        eta = t.get("eta") or 0
-        name = html.escape((t.get("name") or "?")[:60])
-        state, detail = _describe(t, seeds, swarm_seeds, speed, eta)
-        if "💀" in state:
-            stuck = True
-        lines.append(f"• {name}\n   {pct:.1f}%  •  {state}{detail}")
+    text, active = _status_text(torrents)
+    message = await update.effective_message.reply_text(
+        text + ("\n\n<i>updating live…</i>" if active else ""),
+        parse_mode=ParseMode.HTML,
+    )
 
-    text = "📥 <b>Downloads</b>\n\n" + "\n".join(lines)
-    if stuck:
-        # Otherwise a dead torrent just sits at 0% forever with no explanation
-        # of why, which looks identical to "still starting up".
-        text += (
-            "\n\n💀 — nobody is seeding this, it cannot be downloaded.\n"
-            "Cancel it with /cancel and pick a release that has seeders."
-        )
+    if not active:
+        return
 
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+    # Keep this one message current instead of making the user ask again.
+    context.application.create_task(_follow_status(context, message))
+
+
+async def _follow_status(context: ContextTypes.DEFAULT_TYPE, message: Any) -> None:
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    deadline = STATUS_MAX_MINUTES * 60 / STATUS_REFRESH_SECONDS
+    previous = None
+
+    for _ in range(int(deadline)):
+        await asyncio.sleep(STATUS_REFRESH_SECONDS)
+        try:
+            torrents = await qbit.torrents(category=CATEGORY)
+        except Exception:  # noqa: BLE001 - a blip shouldn't kill the updater
+            log.exception("live status refresh failed")
+            continue
+
+        if not torrents:
+            await _edit_status(message, "Nothing is downloading right now.")
+            return
+
+        text, active = _status_text(torrents)
+        suffix = "\n\n<i>updating live…</i>" if active else "\n\n<i>finished</i>"
+        body = text + suffix
+
+        # Telegram rejects an edit that changes nothing, and a stalled
+        # download produces identical text every time.
+        if body != previous:
+            await _edit_status(message, body)
+            previous = body
+
+        if not active:
+            return
+
+    await _edit_status(message, (previous or "") + "\n<i>(stopped updating)</i>")
+
+
+async def _edit_status(message: Any, text: str) -> None:
+    try:
+        await message.edit_text(text, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        # Message deleted, too old to edit, or rate limited -- none of which
+        # is worth surfacing to the user mid-download.
+        log.debug("could not edit status message", exc_info=True)
 
 
 def _describe(
