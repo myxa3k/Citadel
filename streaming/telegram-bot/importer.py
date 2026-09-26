@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,7 +36,15 @@ EPISODE_PATTERNS = [
     re.compile(r"[Ss](\d{1,2})[Ee](\d{1,3})"),
     re.compile(r"(?:^|[\s._\-\[])(\d{1,3})[\s._\-]*(?:of|из|/)[\s._\-]*\d{1,3}", re.I),
     re.compile(r"[\s._\-]\-[\s._]*(\d{1,3})[\s._\-]"),
+    # "Show.E07", no season given.
+    re.compile(r"(?:^|[\s._\-])[Ee](\d{1,3})(?:[\s._\-]|$)"),
+    # "Show 12 серия" / "12 серия" -- how Russian fansub packs are named.
+    re.compile(r"(\d{1,3})\s*(?:серия|серии|эпизод)", re.I),
     re.compile(r"^(\d{1,3})[.\s_\-]"),
+    # Number just before the extension: "[Group] Show 02.srt". Last resort,
+    # since any number in the name could match -- but subtitle files are
+    # usually named exactly this way.
+    re.compile(r"[\s._\-](\d{1,3})\.[A-Za-z0-9]{2,4}$"),
 ]
 
 # Noise that sits between the title and the technical tags. Cutting at the
@@ -199,6 +208,56 @@ def _subtitle_language(path: Path) -> str | None:
     if latin > 20:
         return "en"
     return None
+
+
+def attach_subtitles(
+    subtitles: list[Path], show_dir: Path, language: str | None = None
+) -> tuple[int, int]:
+    """Place loose subtitle files next to the episodes they belong to.
+
+    For subtitles fetched by hand -- the case where no Russian release of a
+    show exists and the video came from an English one. Each file is matched
+    to an episode by the number in its name, then linked beside that episode
+    as `<Episode>.<lang>.ass`, the shape Jellyfin reads as a selectable
+    track.
+
+    Returns (attached, unmatched).
+    """
+    episodes: dict[tuple[int, int], Path] = {}
+    for video in show_dir.rglob("*"):
+        if not video.is_file() or video.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        parsed = episode_number(video.name)
+        if parsed:
+            episodes[parsed] = video
+
+    attached = unmatched = 0
+    for subtitle in subtitles:
+        parsed = episode_number(subtitle.name)
+        # A season pack of subtitles usually numbers episodes without a
+        # season, while the video may sit in "Season 01" -- try both.
+        video = episodes.get(parsed) if parsed else None
+        if video is None and parsed:
+            video = next(
+                (v for (_, ep), v in episodes.items() if ep == parsed[1]), None
+            )
+        if video is None:
+            unmatched += 1
+            continue
+
+        lang = language or _subtitle_language(subtitle) or "ru"
+        target = video.with_suffix("")
+        target = target.with_name(f"{target.name}.{lang}{subtitle.suffix}")
+        try:
+            if target.exists():
+                target.unlink()
+            shutil.copy2(subtitle, target)
+            attached += 1
+        except OSError:
+            log.exception("could not place subtitle %s", subtitle)
+            unmatched += 1
+
+    return attached, unmatched
 
 
 def _video_files(source: Path) -> list[Path]:

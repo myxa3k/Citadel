@@ -21,6 +21,8 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,7 +53,12 @@ from clients import (
     TorrentNotAdded,
 )
 from following import Followed, FollowStore
-from importer import clean_title, import_download
+from importer import (
+    SUBTITLE_SUFFIXES,
+    attach_subtitles,
+    clean_title,
+    import_download,
+)
 from ranking import Scored, rank
 from titles import alternative_titles
 
@@ -217,6 +224,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/delete — remove a show and its torrent\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
+        "<b>Subtitles</b>\n"
+        "Send me an .ass/.srt file (or a .zip of them) and pick the show — "
+        "I'll match them to episodes and put them in place. For when a show "
+        "has no Russian release and you found subtitles yourself.\n\n"
         "🌱 is how many people are sharing. Zero means it will never "
         "download, however long you wait.",
         parse_mode=ParseMode.HTML,
@@ -798,6 +809,158 @@ def _orphans(download_roots: list[str], managed: set[str]) -> list[tuple[Path, i
             found.append((entry, size))
 
     return sorted(found, key=lambda item: -item[1])
+
+
+async def on_subtitle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """A subtitle file (or a zip of them) sent straight to the chat.
+
+    Exists because some shows simply have no Russian release -- the video
+    comes from an English one and the subtitles have to be found by hand.
+    Rather than routing that through filebrowser and a rename, drop the file
+    here and pick the show.
+    """
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    document = update.effective_message.document
+    if document is None:
+        return
+
+    name = (document.file_name or "").lower()
+    is_archive = name.endswith(".zip")
+    if not is_archive and Path(name).suffix not in SUBTITLE_SUFFIXES:
+        return
+
+    entries = await asyncio.to_thread(_library_entries, config)
+    if not entries:
+        await update.effective_message.reply_text(
+            "The library is empty — download the show first, then send subtitles."
+        )
+        return
+
+    status = await update.effective_message.reply_text("📥 Receiving…")
+
+    staging = Path(tempfile.mkdtemp(prefix="subs-"))
+    try:
+        payload = staging / (document.file_name or "subtitles")
+        handle = await document.get_file()
+        await handle.download_to_drive(custom_path=payload)
+
+        if is_archive:
+            await asyncio.to_thread(_extract_subtitles, payload, staging)
+            payload.unlink(missing_ok=True)
+
+        found = sorted(
+            p for p in staging.rglob("*")
+            if p.is_file() and p.suffix.lower() in SUBTITLE_SUFFIXES
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("could not receive subtitles")
+        shutil.rmtree(staging, ignore_errors=True)
+        await status.edit_text(f"Could not read that file: {exc}")
+        return
+
+    if not found:
+        shutil.rmtree(staging, ignore_errors=True)
+        await status.edit_text("No subtitle files in there.")
+        return
+
+    # Offer the library, most recently added first -- subtitles almost always
+    # follow a download that just happened.
+    shows = sorted(entries, key=lambda e: e[1])[:10]
+    context.bot_data["subs_pending"] = (str(staging), shows)
+
+    rows = [
+        [InlineKeyboardButton(f"{title[:40]}", callback_data=f"subs:{i}")]
+        for i, (_, title, _, _) in enumerate(shows)
+    ]
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="subs:x")])
+
+    await status.edit_text(
+        f"Got <b>{len(found)}</b> subtitle file(s).\n\nWhich show are they for?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+def _extract_subtitles(archive: Path, destination: Path) -> None:
+    """Unpack only the subtitle entries, flattened.
+
+    Archive members are written by name alone: a crafted zip can otherwise
+    contain paths like `../../etc` and write outside the staging directory.
+    """
+    with zipfile.ZipFile(archive) as bundle:
+        for member in bundle.namelist():
+            suffix = Path(member).suffix.lower()
+            if suffix not in SUBTITLE_SUFFIXES:
+                continue
+            target = destination / Path(member).name
+            with bundle.open(member) as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+
+async def on_subtitle_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    pending = context.bot_data.pop("subs_pending", None)
+    if pending is None:
+        await query_cb.edit_message_text("That upload has expired — send the file again.")
+        return
+
+    staging_path, shows = pending
+    staging = Path(staging_path)
+
+    _, choice = query_cb.data.split(":", 1)
+    if choice == "x":
+        shutil.rmtree(staging, ignore_errors=True)
+        await query_cb.edit_message_text("Cancelled.")
+        return
+
+    try:
+        kind, title, _, _ = shows[int(choice)]
+    except (ValueError, IndexError):
+        shutil.rmtree(staging, ignore_errors=True)
+        await query_cb.edit_message_text("That choice is no longer valid.")
+        return
+
+    config: Config = context.bot_data["config"]
+    show_dir = Path(config.media_paths[kind]) / title
+    subtitles = sorted(
+        p for p in staging.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUBTITLE_SUFFIXES
+    )
+
+    try:
+        attached, unmatched = await asyncio.to_thread(
+            attach_subtitles, subtitles, show_dir
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("attaching subtitles failed")
+        await query_cb.edit_message_text(f"Could not attach them: {exc}")
+        return
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
+    if jellyfin is not None and attached:
+        try:
+            await jellyfin.refresh_library()
+        except Exception:  # noqa: BLE001
+            log.exception("jellyfin refresh failed after subtitles")
+
+    note = (
+        f"\n{unmatched} could not be matched to an episode."
+        if unmatched
+        else ""
+    )
+    await query_cb.edit_message_text(
+        f"💬 Attached <b>{attached}</b> subtitle(s) to "
+        f"<b>{html.escape(title)}</b>.{note}\n\n"
+        "Pick the track in Jellyfin's player.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1398,6 +1561,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
+    app.add_handler(CallbackQueryHandler(on_subtitle_target, pattern=r"^subs:"))
+    app.add_handler(
+        MessageHandler(filters.Document.ALL & chat_filter, on_subtitle_file)
+    )
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))

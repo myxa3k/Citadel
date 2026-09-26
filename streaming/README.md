@@ -447,6 +447,26 @@ Sources that sound like they should help, and don't:
 So Bazarr is worth having for live-action and for English subtitles, but for
 anime the release choice does the work.
 
+### When no Russian release exists
+
+Some shows only have English releases — Yuru Yuri's first season is one.
+For those, **send the subtitle files to the bot**: drop an `.ass`/`.srt`, or
+a `.zip` of a whole season, into the topic and pick the show from the
+buttons. Episodes are matched by the number in the filename, the language is
+detected from the dialogue, and each file lands beside its episode as
+`<Episode>.ru.ass` — the naming Jellyfin reads as a selectable track.
+
+Matching handles the shapes subtitle packs actually use: `S01E03`,
+`- 05 -`, `E07`, `12 серия`, a bare `08`, and a trailing `Show 02.srt`.
+Anything it can't place is reported rather than silently dropped.
+
+Fully automatic fetching was investigated and isn't available. anime365 has
+the largest Russian anime subtitle collection — 44 translations on a single
+episode, including the season Bazarr couldn't help with — but its public API
+returns only player URLs, never the files, so pulling them would mean
+scraping around a deliberate limit. jimaku.cc has a proper API but needs a
+free key; worth revisiting. Kitsunekko has no Russian section at all.
+
 Provider choice is constrained by the same thing that killed RuTracker: this
 host's IP is a datacentre address, and most subtitle sites treat it
 accordingly. What was tried and why it was dropped:
