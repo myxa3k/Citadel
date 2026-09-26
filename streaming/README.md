@@ -174,6 +174,66 @@ everywhere but clutter every reply for actions the `/` menu already covers.
 Inline buttons are still used where they carry real choices — picking a
 release, confirming a delete.
 
+## Sharper picture (Anime4K)
+
+Anime upscaling runs **on the machine you watch from**, not on the server.
+That isn't a shortcut — this VM has two cores, no graphics card, and
+`/dev/dri` is a QEMU stub, so a neural upscale would take days per episode
+and pin the server while doing it. RAM doesn't change that: the work needs
+parallel compute, not memory. Meanwhile a GPU does the same job in real time
+while the episode plays, costing nothing and touching no files.
+
+It's worth being clear about what this does: it makes 1080p noticeably
+cleaner and sharper on a 4K screen — tighter lines, less blur. It does not
+create a real 4K master. A native 2160p release still looks better, so take
+one when it exists.
+
+Each person sets this up once, on their own PC. There's nothing to automate
+from the server's side, but the files are kept on it so nobody has to go
+hunting: **filebrowser → `_setup/`** (`http://<tailscale-ip>:8081`).
+
+### Steps
+
+1. **Install Jellyfin Media Player** — the desktop app, from
+   [jellyfin.org/downloads](https://jellyfin.org/downloads/clients). The web
+   player can't run shaders; this one is built on mpv, which can. Library,
+   resume points and everything else work the same.
+
+2. **Download `_setup/` from filebrowser** — the `shaders/` folder plus
+   `mpv.conf` and `input.conf`.
+
+3. **Drop them into the player's config folder:**
+
+   | OS | Folder |
+   |---|---|
+   | Windows | `%LOCALAPPDATA%\JellyfinMediaPlayer\` |
+   | macOS | `~/Library/Application Support/Jellyfin Media Player/` |
+   | Linux | `~/.local/share/jellyfinmediaplayer/` |
+
+   It should end up as `mpv.conf`, `input.conf` and `shaders/` side by side
+   in that folder. Create it if the player hasn't been run yet.
+
+4. **Restart the player**, start an episode, press **CTRL+1**.
+
+### While watching
+
+| Key | Preset |
+|---|---|
+| CTRL+1 | Mode A — restores lines. Start here |
+| CTRL+2 | Mode B — for blurry sources |
+| CTRL+3 | Mode C — lightest, for noisy or old releases |
+| CTRL+4 | Mode A+A — heaviest and sharpest |
+| CTRL+0 | Off, for comparing |
+
+Toggle CTRL+1 and CTRL+0 on a detailed frame to judge the difference — a
+dark or near-static scene shows almost nothing either way.
+
+An RTX 4070 runs any preset without dropping frames. On integrated graphics
+stay at CTRL+3 or lower; if playback stutters, drop a preset.
+
+**Phones and TVs can't do this** — their players don't support shaders. For
+those, a native 2160p release is the only route to a sharper picture.
+
 ## Manual uploads
 
 `http://<tailscale-ip>:8081` — drag a file in, it lands in
