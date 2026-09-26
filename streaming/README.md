@@ -37,6 +37,72 @@ Media sits on the 500 GB data disk; service config stays on the system disk.
 (hundreds of gigabytes of torrents) would make an off-site backup pointless.
 That's a deliberate difference from `drive/`, where the data is irreplaceable.
 
+## For everyone else
+
+If you just want to watch, you need two things and neither involves this
+repository:
+
+1. **A Jellyfin account** — ask for one, then open the server in any browser.
+   That alone gets you the whole library, on any device.
+2. **Optional, PC only:** sharper picture via Anime4K — see
+   [Sharper picture](#sharper-picture-anime4k). Phones and TVs can't do it.
+
+To *request* something that isn't there yet, ask in the Telegram topic with
+`/search <name>` — in Russian or English, whichever you know the title by.
+
+## Rebuilding from nothing
+
+Worth knowing what is and isn't recoverable here. Unlike `drive/`, **none of
+this is backed up on purpose** — every file is re-downloadable, and hundreds
+of gigabytes of torrents in an off-site backup would cost real money to
+protect something that costs nothing to fetch again.
+
+What actually matters if the VM dies:
+
+| Thing | Where it lives | Recoverable? |
+|---|---|---|
+| Compose file, bot source | this repo | yes |
+| Service config (`*/config/`) | on the VM only | no — reconfigure |
+| `.env` files | on the VM only | no — recreate from `.example` |
+| Media and downloads | `/mnt/storage` | only if that disk survived |
+| Followed shows | `telegram-bot/state/` | no, but it's a short list |
+
+### Steps
+
+1. **Install Docker** and bring up Tailscale on the new machine.
+
+2. **Clone this repo** to `~/docker/streaming`, or copy the `streaming/`
+   directory there.
+
+3. **Create the two `.env` files** from their `.example` neighbours:
+   - `.env` — `TAILSCALE_IP` from `tailscale ip -4`
+   - `telegram-bot/.env` — bot token, chat id, and the API keys below
+
+4. **Apply the boot-order fixes**, or containers won't come back after a
+   reboot (the tailnet address isn't up yet when Docker starts):
+
+   ```bash
+   echo "net.ipv4.ip_nonlocal_bind = 1" | sudo tee /etc/sysctl.d/99-nonlocal-bind.conf
+   sudo sysctl -p /etc/sysctl.d/99-nonlocal-bind.conf
+   sudo mkdir -p /etc/systemd/system/docker.service.d
+   printf '[Unit]\nAfter=tailscaled.service\n' | sudo tee /etc/systemd/system/docker.service.d/10-after-tailscale.conf
+   sudo systemctl daemon-reload
+   ```
+
+5. **Start it:** `docker compose -f streaming-compose.yaml up -d`
+
+6. **Collect the API keys** the bot needs, then restart it:
+   - Prowlarr — Settings → General → API Key
+   - qBittorrent — set a WebUI password; the temporary one is printed in
+     `docker logs streaming_qbittorrent` on first start
+   - Jellyfin — Dashboard → API Keys → new key
+
+7. **Re-add the indexers** in Prowlarr (see [Indexers](#indexers)) and point
+   Jellyfin at `/media/anime`, `/media/series`, `/media/movies`.
+
+The bot needs no state beyond its `.env` — search results are in memory and
+the follow list is a JSON file you can retype in a minute.
+
 ## Running it
 
 ```bash
@@ -192,28 +258,66 @@ Each person sets this up once, on their own PC. There's nothing to automate
 from the server's side, but the files are kept on it so nobody has to go
 hunting: **filebrowser → `_setup/`** (`http://<tailscale-ip>:8081`).
 
+### Not Jellyfin Media Player
+
+The obvious candidate is Jellyfin Media Player — it embeds mpv, so shaders
+ought to work. They don't, and it's worth writing down why so nobody repeats
+the afternoon it cost:
+
+```
+GL_VERSION='OpenGL ES 3.2'
+Disabling HDR peak computation (compute shaders=0, SSBO=1)
+```
+
+Its UI is Qt WebEngine, which takes an EGL/GLES context, and the embedded
+mpv inherits it. Anime4K is built on compute shaders, and GLES 3.2 has none.
+Setting `useOpenGL: true` in its config changes nothing; neither does
+forcing `QT_QPA_PLATFORM=xcb`. It also never reads `mpv.conf` at all —
+confirmed by stracing it. Standalone mpv on the same machine, same Wayland
+session, same GPU reports `Detected desktop OpenGL 4.4` and loads the
+shaders fine.
+
+So playback goes through **jellyfin-mpv-shim**: Jellyfin keeps the library,
+progress and SyncPlay, while a real mpv does the drawing.
+
 ### Steps
 
-1. **Install Jellyfin Media Player** — the desktop app, from
-   [jellyfin.org/downloads](https://jellyfin.org/downloads/clients). The web
-   player can't run shaders; this one is built on mpv, which can. Library,
-   resume points and everything else work the same.
+1. **Install `jellyfin-mpv-shim`**
 
-2. **Download `_setup/` from filebrowser** — the `shaders/` folder plus
-   `mpv.conf` and `input.conf`.
+   | OS | How |
+   |---|---|
+   | Windows | installer from the [releases page](https://github.com/jellyfin/jellyfin-mpv-shim/releases) |
+   | macOS | `brew install --cask jellyfin-mpv-shim` |
+   | Linux | your package manager, or `pipx install jellyfin-mpv-shim` |
+   | NixOS | add `jellyfin-mpv-shim` to your packages and rebuild |
 
-3. **Drop them into the player's config folder:**
+2. **Run it once and sign in** to the server. It then sits in the tray — it
+   is a *receiver*, not somewhere you browse. The window with the logo is
+   just an indicator; there's no library in it.
+
+3. **Download `_setup/` from filebrowser** (`http://<tailscale-ip>:8081`) —
+   the `shaders/` folder plus `mpv.conf` and `input.conf`.
+
+4. **Put them in the shim's config folder:**
 
    | OS | Folder |
    |---|---|
-   | Windows | `%LOCALAPPDATA%\JellyfinMediaPlayer\` |
-   | macOS | `~/Library/Application Support/Jellyfin Media Player/` |
-   | Linux | `~/.local/share/jellyfinmediaplayer/` |
+   | Windows | `%APPDATA%\jellyfin-mpv-shim\` |
+   | macOS | `~/Library/Application Support/jellyfin-mpv-shim/` |
+   | Linux | `~/.config/jellyfin-mpv-shim/` |
 
-   It should end up as `mpv.conf`, `input.conf` and `shaders/` side by side
-   in that folder. Create it if the player hasn't been run yet.
+   `mpv.conf`, `input.conf` and `shaders/` end up side by side. The folder
+   already exists with empty `mpv.conf`/`input.conf` after step 2 — overwrite
+   them.
 
-4. **Restart the player**, start an episode, press **CTRL+1**.
+5. **Restart the shim.** Anime4K Mode A is on from the first frame; the
+   config enables it rather than waiting for a keypress.
+
+### Watching
+
+Open Jellyfin as usual — browser, phone, anything. Pick an episode, press
+play, then hit the **Cast** icon and choose your PC. It opens in an mpv
+window with the shaders already running.
 
 ### While watching
 
