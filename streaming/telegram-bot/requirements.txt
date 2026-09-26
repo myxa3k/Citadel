@@ -1,2 +1,4 @@
-python-telegram-bot==21.9
+# job-queue extra pulls in APScheduler, which the finished-download poller
+# (check_finished) runs on -- without it Application.job_queue is None.
+python-telegram-bot[job-queue]==21.9
 httpx==0.27.2

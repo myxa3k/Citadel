@@ -21,6 +21,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -36,6 +37,7 @@ from telegram.ext import (
 )
 
 from clients import JellyfinClient, ProwlarrClient, QBittorrentClient, Release
+from importer import import_download
 from ranking import Scored, rank
 
 logging.basicConfig(
@@ -73,6 +75,7 @@ class Config:
     jellyfin_url: str | None
     jellyfin_key: str | None
     save_paths: dict[str, str] = field(default_factory=dict)
+    media_paths: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -99,6 +102,11 @@ class Config:
                 "anime": os.environ.get("PATH_ANIME", "/data/downloads/anime"),
                 "series": os.environ.get("PATH_SERIES", "/data/downloads/series"),
                 "movies": os.environ.get("PATH_MOVIES", "/data/downloads/movies"),
+            },
+            media_paths={
+                "anime": os.environ.get("MEDIA_ANIME", "/data/media/anime"),
+                "series": os.environ.get("MEDIA_SERIES", "/data/media/series"),
+                "movies": os.environ.get("MEDIA_MOVIES", "/data/media/movies"),
             },
         )
 
@@ -365,6 +373,103 @@ async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+# Torrents already imported, so a completed download isn't linked again every
+# time the job runs. Lost on restart, which is harmless: import_download skips
+# files that already exist in the library.
+IMPORTED: set[str] = set()
+
+# qBittorrent states that mean the data is fully downloaded. It keeps seeding
+# afterwards, so waiting for the torrent to stop would mean waiting forever.
+DONE_STATES = {
+    "uploading",
+    "stalledUP",
+    "queuedUP",
+    "forcedUP",
+    "pausedUP",
+    "stoppedUP",
+    "checkingUP",
+}
+
+
+async def check_finished(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Link finished downloads into the library and say so in the chat.
+
+    Runs on a timer rather than off a qBittorrent webhook: qBittorrent can
+    only call an external program, not post to a URL, so polling is the
+    simpler mechanism that doesn't need anything installed in its container.
+    """
+    config: Config = context.bot_data["config"]
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+
+    try:
+        torrents = await qbit.torrents(category=CATEGORY)
+    except Exception:  # noqa: BLE001 - a transient failure shouldn't kill the job
+        log.exception("could not list torrents")
+        return
+
+    for torrent in torrents:
+        key = torrent.get("hash") or ""
+        if not key or key in IMPORTED:
+            continue
+        if torrent.get("state") not in DONE_STATES:
+            continue
+        if (torrent.get("progress") or 0) < 1:
+            continue
+
+        kind = _kind_for(torrent.get("save_path") or "", config)
+        media_root = config.media_paths.get(kind)
+        content = torrent.get("content_path") or ""
+        if not media_root or not content:
+            continue
+
+        try:
+            result = await asyncio.to_thread(
+                import_download,
+                Path(content),
+                Path(media_root),
+                kind,
+                torrent.get("name") or Path(content).name,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("import failed for %s", torrent.get("name"))
+            IMPORTED.add(key)  # don't retry a broken one every minute
+            continue
+
+        IMPORTED.add(key)
+        if result.linked == 0:
+            log.info("nothing new to link for %s", result.title)
+            continue
+
+        log.info("imported %s (%d files)", result.title, result.linked)
+
+        jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
+        if jellyfin is not None:
+            try:
+                await jellyfin.refresh_library()
+            except Exception:  # noqa: BLE001
+                log.exception("jellyfin refresh failed")
+
+        await context.bot.send_message(
+            chat_id=config.chat_id,
+            message_thread_id=config.thread_id,
+            text=(
+                f"🎬 <b>{html.escape(result.title)}</b> готово\n"
+                f"{result.linked} файлов добавлено в библиотеку — можно смотреть в Jellyfin."
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+
+
+def _kind_for(save_path: str, config: Config) -> str:
+    for kind, path in config.save_paths.items():
+        if save_path.rstrip("/") == path.rstrip("/"):
+            return kind
+    # Fall back on the folder name, which is how the save paths are built
+    # anyway -- covers a torrent moved by hand in qBittorrent.
+    tail = Path(save_path).name
+    return tail if tail in config.media_paths else "series"
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("unhandled error", exc_info=context.error)
 
@@ -406,6 +511,11 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, on_search)
     )
     app.add_error_handler(on_error)
+
+    # Poll for finished downloads. A minute is frequent enough that "готово"
+    # lands while you're still looking at the chat, and cheap -- it's one
+    # local API call against qBittorrent.
+    app.job_queue.run_repeating(check_finished, interval=60, first=20)
 
     app.run_polling(drop_pending_updates=True)
 

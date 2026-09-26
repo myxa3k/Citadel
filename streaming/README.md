@@ -65,6 +65,34 @@ what's currently downloading.
 untouched, so either works depending on where the release lives. This is the
 whole reason the bot exists: see "Why the bot" below.
 
+## From "downloaded" to "watchable"
+
+qBittorrent saves into `/data/downloads/<kind>/`; Jellyfin only reads
+`/data/media/<kind>/`. Sonarr normally bridges that, but it never sees these
+downloads — the bot hands torrents straight to qBittorrent, for the reason in
+"Why the bot" below.
+
+So the bot bridges it instead (`importer.py`). Once a minute it checks its own
+torrents, and for each one that finished:
+
+1. Derives a library title from the release name — release-group handles
+   (`- ZaLmanVsk`, `- VARYG`) are stripped, real subtitles (`- Kyoto Saga`,
+   `- Final Season`) are kept, and where a Russian release carries both names
+   the Latin one wins, because metadata providers match on it.
+2. **Hardlinks** each video file into
+   `media/<kind>/<Title>/Season NN/<Title> - SNNENN.mkv`. Hardlinks, not
+   copies: `downloads/` and `media/` are the same filesystem, so the library
+   entry is instant, costs no extra space, and the torrent keeps seeding from
+   the original path.
+3. Triggers a Jellyfin library refresh and posts "готово" to the topic.
+
+Episode numbers are read from `S01E05`, `- 05 -`, `05 of 12`, or a leading
+`05.` — the four shapes these indexers actually produce. A file with no
+recognisable number is still linked, just unrenamed, rather than dropped.
+
+Re-running is safe: files already present are skipped, so nothing is
+duplicated if the job runs again over the same torrent.
+
 ## Manual uploads
 
 `http://<tailscale-ip>:8081` — drag a file in, it lands in

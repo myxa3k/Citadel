@@ -95,6 +95,9 @@ services:
       - ./jellyfin/config:/config
       - ./jellyfin/cache:/cache
       - /mnt/storage/media:/media
+      # Whatever gets uploaded through filebrowser, watchable without anyone
+      # having to sort it into the library first.
+      - /mnt/storage/manual-import:/manual
     ports:
       - "127.0.0.1:8096:8096"
       - "${TAILSCALE_IP}:8096:8096"
@@ -111,6 +114,11 @@ services:
     container_name: streaming_bot
     env_file:
       - ./telegram-bot/.env
+    volumes:
+      # Same /data as qBittorrent and Jellyfin, so the paths qBittorrent
+      # reports resolve here too and finished downloads can be hardlinked
+      # into the library without copying.
+      - /mnt/storage:/data
     restart: unless-stopped
     depends_on:
       - streaming_prowlarr
