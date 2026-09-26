@@ -161,21 +161,18 @@ Deleting a show in Jellyfin instead also removes the library files (if the
 library permits it) but leaves the torrent seeding, so the space stays used.
 Prefer `/delete`.
 
-## The control panel
+## Finding the commands
 
-The bot attaches a row of buttons under its own messages — Status, New,
-Following, Library, Disk, Help — covering everything that takes no argument.
-Searching still needs typing, since a button can't carry a title.
+The `/` menu beside the message box lists every command with a description.
+Telegram keeps that list in sync from `set_my_commands`, so it never drifts
+the way a pinned message would.
 
-These are **inline** buttons, not a reply keyboard, and that choice is forced
-by where the bot lives. A reply keyboard is the obvious fit and does pin
-itself under the message box — but only in a private chat. In a group
-Telegram collapses it into a small icon beside the input field, so in a forum
-topic it isn't a visible panel at all. Inline buttons render the same
-everywhere and stay clickable in the history.
-
-The `/` menu beside the message box lists every command with a description;
-Telegram keeps it in sync, which a pinned message wouldn't.
+Nothing else is attached to the bot's messages. A button panel was tried and
+removed: a reply keyboard only pins itself under the input box in a private
+chat (in a group Telegram collapses it to an icon), and inline buttons work
+everywhere but clutter every reply for actions the `/` menu already covers.
+Inline buttons are still used where they carry real choices — picking a
+release, confirming a delete.
 
 ## Manual uploads
 

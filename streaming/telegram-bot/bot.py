@@ -134,33 +134,6 @@ class Config:
 SEARCHES: dict[str, list[Scored]] = {}
 
 
-def _main_keyboard() -> InlineKeyboardMarkup:
-    """The control panel, attached underneath the bot's own messages.
-
-    A reply keyboard would be the obvious choice, but in a group Telegram
-    collapses it into an icon beside the message box instead of pinning it
-    under the chat -- so in a forum topic it isn't the visible panel it is in
-    a private chat. Inline buttons render identically everywhere and stay
-    clickable in the history, which is what actually makes this usable here.
-    """
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("📥 Status", callback_data="do:status"),
-                InlineKeyboardButton("🆕 New", callback_data="do:new"),
-            ],
-            [
-                InlineKeyboardButton("🔔 Following", callback_data="do:following"),
-                InlineKeyboardButton("📚 Library", callback_data="do:library"),
-            ],
-            [
-                InlineKeyboardButton("💾 Disk", callback_data="do:disk"),
-                InlineKeyboardButton("❔ Help", callback_data="do:help"),
-            ],
-        ]
-    )
-
-
 def _authorised(config: Config, update: Update) -> bool:
     user = update.effective_user
     if user is None:
@@ -246,7 +219,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🌱 is how many people are sharing. Zero means it will never "
         "download, however long you wait.",
         parse_mode=ParseMode.HTML,
-        reply_markup=_main_keyboard(),
     )
 
 
@@ -290,9 +262,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Cancel it with /cancel and pick a release that has seeders."
         )
 
-    await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=_main_keyboard()
-    )
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 def _describe(
@@ -892,28 +862,6 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query_cb.edit_message_text("❌ Cancelled and removed.")
 
 
-async def on_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """A tap on the control panel."""
-    query_cb = update.callback_query
-    await query_cb.answer()
-
-    _, action = query_cb.data.split(":", 1)
-    handler = {
-        "status": cmd_status,
-        "new": cmd_new,
-        "following": cmd_following,
-        "library": cmd_library,
-        "disk": cmd_disk,
-        "help": cmd_start,
-    }.get(action)
-    if handler is None:
-        return
-
-    # The handlers reply to a message; a callback has one behind it (the
-    # bot's own), and replying there keeps the answer in the same topic.
-    await handler(update, context)
-
-
 async def on_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Plain text in a private chat, where privacy mode doesn't apply."""
     query = (update.effective_message.text or "").strip()
@@ -1247,7 +1195,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
-    app.add_handler(CallbackQueryHandler(on_panel, pattern=r"^do:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & chat_filter, on_search)
     )
