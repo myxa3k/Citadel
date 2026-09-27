@@ -72,12 +72,42 @@ SPECIAL_MARKERS = re.compile(
 )
 
 
-def is_special(name: str) -> bool:
-    """Whether a filename is a special/OVA rather than a numbered episode."""
+# Folder names a release uses for its specials. A pack advertised as
+# "TV-1 + SP + MV" keeps them in a subfolder, and the files inside are not
+# always marked in their own names -- the folder is the only signal.
+SPECIAL_DIRS = {
+    "sp", "specials", "special", "ova", "ovas", "oad", "extra episodes",
+    "сп", "спешлы", "спецвыпуски",
+}
+
+
+def is_special(name: str, path: Path | None = None) -> bool:
+    """Whether a file is a special/OVA rather than a numbered episode.
+
+    `path`, when given, is checked for a specials subfolder as well, since a
+    release that bundles seasons and specials together often marks only the
+    folder.
+    """
     stem = Path(name).stem
     if is_extra(stem):
         return False
-    return SPECIAL_MARKERS.search(stem) is not None
+    if SPECIAL_MARKERS.search(stem) is not None:
+        return True
+    if path is not None:
+        return any(part.strip().lower() in SPECIAL_DIRS for part in path.parts)
+    return False
+
+
+def _relative_to(f: Path, base: Path) -> Path | None:
+    """`f` relative to `base`, or None when it isn't underneath it.
+
+    A single-file download has the file itself as the source path, so there
+    is no folder structure to read a specials marker from.
+    """
+    try:
+        return f.relative_to(base)
+    except ValueError:
+        return None
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -529,7 +559,13 @@ def merge_shows(
                 destination.mkdir(parents=True, exist_ok=True)
                 target = destination / f.name
             else:
-                season = 0 if role == "specials" else number
+                # A specials/OVA file inside a season folder is still a
+                # special. The role describes the folder, but a release that
+                # bundles "TV-1 + SP" puts both in one -- taking the role at
+                # face value filed five-minute shorts as episodes of the
+                # season, numbered over the real ones.
+                is_sp = is_special(f.name, f.relative_to(source))
+                season = 0 if role == "specials" or is_sp else number
                 parsed = episode_number(f.name) or episode_number(f.parent.name)
                 episode = parsed[1] if parsed else None
 
@@ -708,7 +744,7 @@ def import_download(
         # A special shipped inline with the season ("... Sp 1 серия") numbers
         # itself from 1 and would land on top of the real first episode.
         # Season 00 is where it belongs and where nothing competes with it.
-        if is_special(f.name):
+        if is_special(f.name, _relative_to(f, source)):
             parsed = (0, parsed[1] if parsed else 1)
         # "Yuru Yuri ss2 - 05.mkv" numbers the episode but not the season;
         # the season came from the release title, so put it back.
