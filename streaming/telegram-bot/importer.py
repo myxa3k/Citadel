@@ -456,12 +456,28 @@ def attach_subtitles(
 
 
 
+# The suffix a merge gives a second copy of an episode. Recognised on the way
+# back in so re-merging leaves it alone instead of bumping it to alt2.
+RE_ALT_VERSION = re.compile(r" - alt\d+$")
+
+
+@dataclass(slots=True)
+class MergeResult:
+    moved: int
+    #: Files already in place -- the same data, nothing to do.
+    already_there: int
+    #: Episodes that arrived twice from different releases, kept as "alt"
+    #: versions beside the original rather than dropped.
+    duplicates: list[str]
+    problems: list[str]
+
+
 def merge_shows(
     media_root: Path,
     parent: str,
     folders: list[str],
     roles: dict[str, tuple[str, int]],
-) -> tuple[int, list[str]]:
+) -> MergeResult:
     """Fold several show folders into one, each in the role it was given.
 
     `roles` maps a folder to ("season", N), ("specials", 0) or
@@ -478,6 +494,8 @@ def merge_shows(
     target_root = media_root / parent
     target_root.mkdir(parents=True, exist_ok=True)
     moved = 0
+    skipped_same = 0
+    duplicates: list[str] = []
     problems: list[str] = []
 
     for folder in folders:
@@ -488,6 +506,13 @@ def merge_shows(
 
         for f in sorted(source.rglob("*")):
             if not f.is_file():
+                continue
+
+            # An alternate version placed by an earlier merge is already
+            # where it belongs. Re-processing it would renumber it to alt2,
+            # then alt3, one step further on every run.
+            if RE_ALT_VERSION.search(f.stem):
+                skipped_same += 1
                 continue
 
             # A bonus feature keeps its own name wherever it lands: numbering
@@ -522,20 +547,40 @@ def merge_shows(
                         destination
                         / f"{parent} - S{season:02d}E{episode:02d}{suffix}"
                     )
-                    # Two OVA batches both numbered from 1 collide in
-                    # Season 00. Take the next free slot rather than skipping
-                    # the file, which would leave it stranded in a folder the
-                    # merge then refuses to remove.
-                    if season == 0 and target.exists():
-                        probe = episode
-                        while target.exists() and probe < 200:
-                            probe += 1
-                            target = (
-                                destination
-                                / f"{parent} - S00E{probe:02d}{suffix}"
+                    if target.exists() and not _same_file(target, f):
+                        if season == 0:
+                            # Two OVA batches both numbered from 1. Specials
+                            # have no canonical order anyway, so the next free
+                            # slot is as good a place as any.
+                            probe = episode
+                            while target.exists() and probe < 200:
+                                probe += 1
+                                target = (
+                                    destination
+                                    / f"{parent} - S00E{probe:02d}{suffix}"
+                                )
+                        else:
+                            # Two different files claiming one episode: a
+                            # second release of the same season, with its own
+                            # encode or dub. Renumbering would lie about which
+                            # episode it is, so it keeps its number and gains
+                            # a suffix -- Jellyfin shows it as an alternate
+                            # version of that episode rather than a new one.
+                            stem = (
+                                f"{parent} - S{season:02d}E{episode:02d}"
+                                f" - alt{{n}}{suffix}"
+                            )
+                            probe = 0
+                            while target.exists() and probe < 20:
+                                probe += 1
+                                target = destination / stem.format(n=probe)
+                            duplicates.append(
+                                f"S{season:02d}E{episode:02d} ({folder})"
                             )
 
             if target.exists():
+                # Same data already in place -- the merge has nothing to do.
+                skipped_same += 1
                 continue
             try:
                 f.rename(target)
@@ -547,15 +592,18 @@ def merge_shows(
             continue
         # Only the now-empty shell goes. Anything left behind means a file
         # didn't move, and deleting the folder then would lose it.
-        if any(p.is_file() for p in source.rglob("*")):
-            problems.append(f"{folder}: files left behind, folder kept")
+        leftover = [p for p in source.rglob("*") if p.is_file()]
+        if leftover:
+            problems.append(
+                f"{folder}: {len(leftover)} files could not be placed, folder kept"
+            )
             continue
         try:
             shutil.rmtree(source)
         except OSError as exc:
             problems.append(f"{folder}: {exc}")
 
-    return moved, problems
+    return MergeResult(moved, skipped_same, duplicates, problems)
 
 
 def _video_files(source: Path) -> tuple[list[Path], list[Path]]:

@@ -1098,7 +1098,7 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
     try:
-        moved, problems = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             merge_shows, root, parent, merging, {f: roles[f] for f in merging}
         )
     except Exception as exc:  # noqa: BLE001
@@ -1123,7 +1123,7 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     seasons = sorted({roles[f][1] for f in merging if roles[f][0] == "season"})
     text = (
         f"🔗 <b>{html.escape(parent)}</b>\n"
-        f"{len(merging)} folders into one, {moved} files moved."
+        f"{len(merging)} folders into one, {result.moved} files moved."
     )
     if seasons:
         text += f"\nSeasons: {', '.join(str(s) for s in seasons)}."
@@ -1131,13 +1131,32 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         text += "\nSpecials → Season 00."
     if any(roles[f][0] == "extras" for f in merging):
         text += "\nExtras → extras/."
+    if result.already_there:
+        text += f"\n{result.already_there} were already in place."
 
     skipped = [f for f in plan["folders"] if roles[f][0] == "skip"]
     if skipped:
         text += "\n\n<i>Left alone: " + html.escape(", ".join(skipped)) + "</i>"
-    if problems:
+
+    # Worth saying plainly: two releases of one season means two files for
+    # the same episode, and silently keeping one would look like data loss.
+    if result.duplicates:
+        shown = ", ".join(result.duplicates[:6])
+        more = (
+            f" and {len(result.duplicates) - 6} more"
+            if len(result.duplicates) > 6
+            else ""
+        )
+        text += (
+            f"\n\n⚠️ <b>{len(result.duplicates)} episodes arrived twice</b>\n"
+            f"{html.escape(shown)}{more}.\n"
+            "<i>Kept both — the second is beside the first as “ - alt1”. "
+            "Two releases of one season, so pick whichever you prefer and "
+            "delete the other.</i>"
+        )
+    if result.problems:
         text += "\n\n<b>Not moved:</b>\n" + "\n".join(
-            f"  • {html.escape(p)}" for p in problems[:5]
+            f"  • {html.escape(p)}" for p in result.problems[:5]
         )
     await query_cb.edit_message_text(text, parse_mode=ParseMode.HTML)
 
