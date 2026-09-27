@@ -62,6 +62,7 @@ from importer import (
     attach_subtitles,
     clean_title,
     import_download,
+    is_extra,
     match_key,
     merge_shows,
 )
@@ -724,7 +725,13 @@ async def on_new_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def _library_entries(config: Config) -> list[tuple[str, str, int, int]]:
-    """Every show in the library: (kind, title, file count, bytes)."""
+    """Every show in the library: (kind, title, episode count, bytes).
+
+    The count is episodes, not files: subtitles sit beside every episode and
+    bonus features in `extras/`, so counting files reported a 12-episode
+    season as 36. The size stays whole -- that is real disk, whatever the
+    file happens to be.
+    """
     entries: list[tuple[str, str, int, int]] = []
     for kind, root in config.media_paths.items():
         base = Path(root)
@@ -734,11 +741,18 @@ def _library_entries(config: Config) -> list[tuple[str, str, int, int]]:
             if not item.is_dir():
                 continue
             files = [f for f in item.rglob("*") if f.is_file()]
+            episodes = sum(
+                1
+                for f in files
+                if f.suffix.lower() in VIDEO_SUFFIXES
+                and "extras" not in f.relative_to(item).parts
+                and not is_extra(f.name)
+            )
             # Hardlinked files are counted once each here even though they
             # share blocks with the download -- what matters to the reader is
             # how big the show is, not how the filesystem stores it.
             size = sum(f.stat().st_size for f in files)
-            entries.append((kind, item.name, len(files), size))
+            entries.append((kind, item.name, episodes, size))
     return entries
 
 
@@ -817,7 +831,12 @@ async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _mergeable_folders(config: Config, query: str = "") -> list[tuple[str, str, int]]:
-    """Every episode folder in the library: (kind, name, video count)."""
+    """Every show folder in the library: (kind, name, episode count).
+
+    Bonus features are left out of the count. A folder holding 12 episodes
+    and 12 creditless openings would otherwise read as "24", which is not a
+    number that helps anyone decide what to merge.
+    """
     found: list[tuple[str, str, int]] = []
     for kind in ("anime", "series"):
         root = config.media_paths.get(kind)
@@ -828,12 +847,15 @@ def _mergeable_folders(config: Config, query: str = "") -> list[tuple[str, str, 
                 continue
             if query and query not in item.name.lower():
                 continue
-            videos = sum(
+            episodes = sum(
                 1
                 for f in item.rglob("*")
-                if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES
+                if f.is_file()
+                and f.suffix.lower() in VIDEO_SUFFIXES
+                and "extras" not in f.relative_to(item).parts
+                and not is_extra(f.name)
             )
-            found.append((kind, item.name, videos))
+            found.append((kind, item.name, episodes))
     return found
 
 

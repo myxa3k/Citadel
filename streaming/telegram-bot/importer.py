@@ -117,10 +117,22 @@ SEASON_MARKERS = [
 ]
 
 
-# "[TV-2]", "[ТВ-3]" -- RuTracker's way of marking a sequel season. Only
-# inside brackets, where the tag actually lives; a loose "TV 2" in a title is
-# more likely part of the name.
-RE_BRACKET_SEASON = re.compile(r"\[\s*(?:TV|ТВ)[\s._\-]*(\d{1,2})\s*\]", re.I)
+# "[TV-2]", "(ТВ-3)" -- how a sequel season is marked on RuTracker, in either
+# kind of bracket. The real torrent names use the round form and put it right
+# after the Russian title:
+#
+#   Свободу Лесбиянкам (ТВ-2) / Yuru Yuri / Yuruyuri / ... [TV] [12 из 12]
+#
+# Matching only the square form meant every season of a show parsed as
+# season None, so all of them were filed as Season 01 and each import
+# overwrote the last -- 12 episodes where there should have been 36.
+#
+# Bracketed only, still: a loose "TV 2" mid-title is more likely part of the
+# name, and the unbracketed form is handled by SEASON_MARKERS where it is
+# anchored to the end.
+RE_BRACKET_SEASON = re.compile(
+    r"[\[(]\s*(?:TV|ТВ)[\s._\-]*(\d{1,2})\s*[\])]", re.I
+)
 
 
 def split_season(raw: str) -> tuple[str, int | None]:
@@ -173,6 +185,37 @@ def clean_title(raw: str) -> str:
     `title_and_season` for that. One show is one folder.
     """
     return title_and_season(raw)[0]
+
+
+def title_candidates(raw: str) -> list[str]:
+    """Every Latin title a release name offers, best first.
+
+    RuTracker lists a show's names slash-separated, and for a sequel the
+    first is the season's own title while a later one is the bare series:
+
+        Свободу Лесбиянкам (ТВ-3) / Yuru Yuri San Hai / Yuruyuri / YRYR
+
+    "Yuru Yuri San Hai" is the better label, but "Yuruyuri" is what matches
+    the folder the first two seasons already went into. Handing back both
+    lets the importer prefer whichever one the library already knows.
+    """
+    head = RE_BRACKET_SEASON.sub(" ", raw)
+    head = re.sub(r"^\s*\[[^\]]{1,30}\]\s*(?=\S)", "", head)
+
+    seen: list[str] = []
+    for part in head.split("/"):
+        part = part.strip()
+        if not re.search(r"[A-Za-z]{3,}", part):
+            continue
+        cut = TITLE_STOP.search(part)
+        if cut and cut.start() > 0:
+            part = part[: cut.start()]
+        cleaned = re.sub(r"[\s._]+", " ", part).strip(" -_.")
+        cleaned = re.sub(r'[<>"/\\|?*]', "-", cleaned.replace(":", " -"))
+        # Acronyms like "YRYR" are a search alias, never a folder name.
+        if len(cleaned) >= 4 and cleaned not in seen and not cleaned.isupper():
+            seen.append(cleaned)
+    return seen
 
 
 def title_and_season(raw: str) -> tuple[str, int | None]:
@@ -533,9 +576,16 @@ def import_download(
     """
     title, stated_season = title_and_season(release_name)
     if kind != "movies":
-        # Reuse the spelling already on disk, so the folder doesn't fork over
-        # a difference in spacing.
-        title = existing_folder(media_root, title) or title
+        # A sequel is posted under its own name ("Yuru Yuri San Hai") while
+        # the same listing also carries the bare series name ("Yuruyuri").
+        # If the library already has a folder under any of the names this
+        # release offers, that folder is the show -- put the season there
+        # rather than starting a second entry for the same series.
+        for candidate in [title, *title_candidates(release_name)]:
+            match = existing_folder(media_root, candidate)
+            if match:
+                title = match
+                break
     files, extras = _video_files(source)
     if not files and not extras:
         return ImportResult(title, media_root, 0, 0)
