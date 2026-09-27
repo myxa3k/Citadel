@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1053,6 +1054,133 @@ async def on_subtitle_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+# When a finished torrent has seeded enough to stop. The trackers here are
+# public, so there is no ratio requirement to satisfy and no credit for
+# seeding -- these numbers are about giving back a fair share, not about
+# meeting a rule.
+SEED_DAYS = 14
+SEED_RATIO = 2.0
+# Warn once the disk passes this. Below it there is nothing to say.
+DISK_WARN_PERCENT = 85
+
+
+def _retired(torrents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Finished torrents that have seeded long enough to remove.
+
+    Anything still downloading is excluded outright: completion_on is 0
+    until the data is complete, and deleting one mid-transfer would throw
+    away a partial download.
+    """
+    now = time.time()
+    done = []
+    for t in torrents:
+        if (t.get("progress") or 0) < 1:
+            continue
+        completed = t.get("completion_on") or 0
+        if completed <= 0:
+            continue
+        age_days = (now - completed) / 86400
+        ratio = t.get("ratio") or 0
+        if age_days >= SEED_DAYS or ratio >= SEED_RATIO:
+            done.append(t)
+    return done
+
+
+async def check_seeding(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Offer to clear torrents that have seeded their share, and warn on disk.
+
+    Runs fortnightly. It only ever proposes -- the same principle as
+    everything else here, since "it looked old" is a poor reason to delete
+    something on its own.
+    """
+    config: Config = context.bot_data["config"]
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+
+    try:
+        torrents = await qbit.torrents()
+    except Exception:  # noqa: BLE001
+        log.exception("seeding check failed")
+        return
+
+    usage = await asyncio.to_thread(shutil.disk_usage, "/data")
+    used_pct = usage.used / usage.total * 100
+
+    retired = _retired(torrents)
+    if not retired and used_pct < DISK_WARN_PERCENT:
+        return
+
+    parts: list[str] = []
+    if used_pct >= DISK_WARN_PERCENT:
+        parts.append(
+            f"⚠️ <b>Disk {used_pct:.0f}% full</b> — {_human(usage.free)} left."
+        )
+
+    markup = None
+    if retired:
+        total = sum(t.get("size") or 0 for t in retired)
+        preview = "\n".join(
+            f"  • {html.escape((t.get('name') or '?')[:44])} — "
+            f"{_human(t.get('size') or 0)}, ratio {t.get('ratio') or 0:.1f}"
+            for t in retired[:6]
+        )
+        more = f"\n  …and {len(retired) - 6} more" if len(retired) > 6 else ""
+        parts.append(
+            f"🌱 <b>{len(retired)} torrents have seeded their share</b> — "
+            f"{_human(total)}\n\n{preview}{more}\n\n"
+            "These are public trackers, so there's no ratio to keep."
+        )
+        context.bot_data["retire_list"] = retired
+        markup = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"🗑 Remove all ({_human(total)})",
+                        callback_data="retire:yes",
+                    )
+                ],
+                [InlineKeyboardButton("✖️ Keep seeding", callback_data="retire:no")],
+            ]
+        )
+
+    await context.bot.send_message(
+        chat_id=config.chat_id,
+        message_thread_id=config.thread_id,
+        text="\n\n".join(parts),
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+
+async def on_retire_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    if query_cb.data == "retire:no":
+        await query_cb.edit_message_text("Left seeding.")
+        return
+
+    retired = context.bot_data.pop("retire_list", None)
+    if not retired:
+        await query_cb.edit_message_text("That list has expired.")
+        return
+
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    freed = 0
+    failed = 0
+    for torrent in retired:
+        try:
+            await qbit.delete(torrent.get("hash", ""), delete_files=True)
+            freed += torrent.get("size") or 0
+        except Exception:  # noqa: BLE001
+            log.exception("could not remove %s", torrent.get("name"))
+            failed += 1
+
+    note = f"\n{failed} could not be removed." if failed else ""
+    await query_cb.edit_message_text(
+        f"🌱 Freed <b>{_human(freed)}</b>.{note}", parse_mode=ParseMode.HTML
+    )
+
+
 async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Find downloads no torrent is responsible for any more."""
     config: Config = context.bot_data["config"]
@@ -1775,6 +1903,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
+    app.add_handler(CallbackQueryHandler(on_retire_choice, pattern=r"^retire:"))
     app.add_handler(CallbackQueryHandler(on_subtitle_target, pattern=r"^subs:"))
     app.add_handler(CallbackQueryHandler(on_torrent_target, pattern=r"^tor:"))
     app.add_handler(CallbackQueryHandler(on_magnet_target, pattern=r"^mag:"))
@@ -1799,6 +1928,11 @@ def main() -> None:
     # so checking more often would mean five sweeps of every indexer for
     # nothing -- and each sweep is one search per alternative title.
     app.job_queue.run_repeating(check_new_episodes, interval=86400, first=300)
+
+    # Seeding review and disk warning, fortnightly. Nothing here changes
+    # quickly enough to be worth asking about more often, and the message
+    # only appears when there is something to act on.
+    app.job_queue.run_repeating(check_seeding, interval=14 * 86400, first=600)
 
     app.run_polling(drop_pending_updates=True)
 

@@ -230,6 +230,24 @@ came from. Both matter — the library files are hardlinks to the download, so
 deleting only one side frees nothing. It takes a second confirming press,
 being the one irreversible action here.
 
+### Seeding review
+
+Every fortnight the bot looks over what's still seeding and offers to clear
+torrents that have given back a fair share — **14 days seeded, or ratio 2.0**,
+whichever comes first. It proposes; nothing is removed without a press.
+
+Worth being clear about why those numbers and not a rule: every tracker
+configured here is public, so **there is no ratio requirement and no credit
+for seeding**. Keeping a torrent alive indefinitely costs disk and gives
+nothing back in return. The thresholds are about sharing fairly, not about
+satisfying anyone's accounting.
+
+Anything still downloading is never touched — `completion_on` is zero until
+the data is complete, and that's checked before a torrent can be considered.
+
+The same job warns when the disk passes **85%**. Both only speak up when
+there's something to act on, so a quiet fortnight produces no message.
+
 `/cleanup` handles a different case: downloads that **no torrent owns any
 more**. They appear when a torrent is removed from qBittorrent without its
 data, or from before this bot existed at all. Nothing tracks them, so they
