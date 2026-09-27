@@ -2166,16 +2166,22 @@ async def on_go(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # files that already exist in the library.
 IMPORTED: set[str] = set()
 
-# qBittorrent states that mean the data is fully downloaded. It keeps seeding
-# afterwards, so waiting for the torrent to stop would mean waiting forever.
-DONE_STATES = {
-    "uploading",
-    "stalledUP",
-    "queuedUP",
-    "forcedUP",
-    "pausedUP",
-    "stoppedUP",
+# States where the files must not be touched yet, whatever the progress
+# says: qBittorrent is still verifying or moving them, so hardlinking now
+# would capture a half-written file or race the move.
+#
+# Everything else at 100% is fair game. Keying off progress rather than an
+# allow-list of "done" states matters because qBittorrent reports 100% while
+# still in "downloading" -- a torrent that finishes but lingers there (the
+# last piece settling, or seeding disabled) was never imported at all, and
+# the omission was silent.
+BUSY_STATES = {
+    "checkingDL",
     "checkingUP",
+    "checkingResumeData",
+    "moving",
+    "allocating",
+    "metaDL",
 }
 
 
@@ -2199,9 +2205,9 @@ async def check_finished(context: ContextTypes.DEFAULT_TYPE) -> None:
         key = torrent.get("hash") or ""
         if not key or key in IMPORTED:
             continue
-        if torrent.get("state") not in DONE_STATES:
-            continue
         if (torrent.get("progress") or 0) < 1:
+            continue
+        if torrent.get("state") in BUSY_STATES:
             continue
 
         kind = _kind_for(torrent.get("save_path") or "", config)
