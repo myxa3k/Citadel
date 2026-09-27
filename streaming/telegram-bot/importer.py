@@ -115,6 +115,28 @@ def _relative_to(f: Path, base: Path) -> Path | None:
         return None
 
 
+def _already_linked(destination: Path, source: Path) -> bool:
+    """Whether `destination` already holds a hardlink of `source`.
+
+    Hardlinks share an inode, so this is exact -- it does not depend on what
+    the existing copy happens to be called, which is the point: a file that
+    an earlier collision pushed to a different episode number is still the
+    same file and must not be linked again.
+    """
+    try:
+        wanted = source.stat().st_ino
+        # st_nlink of 1 means nothing else points at this data, so there is
+        # certainly no existing link to find. Saves scanning the folder for
+        # every file of a fresh import.
+        if source.stat().st_nlink <= 1:
+            return False
+        return any(
+            f.is_file() and f.stat().st_ino == wanted for f in destination.iterdir()
+        )
+    except OSError:
+        return False
+
+
 def _same_file(a: Path, b: Path) -> bool:
     """Whether two paths are the same data -- a hardlink of each other.
 
@@ -837,10 +859,18 @@ def import_download(
             destination = show_root / f"Season {season:02d}"
             destination.mkdir(parents=True, exist_ok=True)
             target = destination / f"{title} - S{season:02d}E{episode:02d}{f.suffix}"
+            # Already here under some number? Then there is nothing to do.
+            # Checking only the slot this file wants is not enough: a file
+            # displaced to E32 by an earlier collision still wants E18, finds
+            # it taken, and gets linked a second time -- which is how 25
+            # specials became 39 entries.
+            if _already_linked(destination, f):
+                skipped += 1
+                continue
             # Two files claiming one slot: take the next free number rather
             # than dropping one of them. Silently skipping is how the season 1
             # special disappeared without ever appearing in the library.
-            if target.exists() and not _same_file(target, f):
+            if target.exists():
                 probe = episode
                 while target.exists() and probe < 200:
                     probe += 1
