@@ -183,6 +183,10 @@ def _results_keyboard(key: str, items: list[Scored], page: int) -> InlineKeyboar
     if nav:
         rows.append(nav)
 
+    # Without this a browsed-and-abandoned search sits in the topic with live
+    # buttons -- a stray tap days later would queue a download.
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data=f"close:{key}")])
+
     return InlineKeyboardMarkup(rows)
 
 
@@ -486,6 +490,7 @@ async def cmd_unfollow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             for i, s in enumerate(shows[:10])
         ]
         context.bot_data["unfollow_list"] = [s.title for s in shows[:10]]
+        rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="close:unfollow")])
         await update.effective_message.reply_text(
             "Unfollow which one?", reply_markup=InlineKeyboardMarkup(rows)
         )
@@ -624,6 +629,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ]
         for i, s in enumerate(waiting[:10])
     ]
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="close:new")])
     await update.effective_message.reply_text(
         "🆕 <b>Something new</b>\n\nPick one:",
         parse_mode=ParseMode.HTML,
@@ -926,7 +932,8 @@ async def _add_torrent_file(
                     InlineKeyboardButton("🎌 Anime", callback_data=f"tor:{key}:anime"),
                     InlineKeyboardButton("📺 TV", callback_data=f"tor:{key}:series"),
                     InlineKeyboardButton("🎬 Film", callback_data=f"tor:{key}:movies"),
-                ]
+                ],
+                [InlineKeyboardButton("✖️ Cancel", callback_data=f"close:{key}")],
             ]
         ),
     )
@@ -1385,7 +1392,8 @@ async def _add_magnet(
                     InlineKeyboardButton("🎌 Anime", callback_data=f"mag:{key}:anime"),
                     InlineKeyboardButton("📺 TV", callback_data=f"mag:{key}:series"),
                     InlineKeyboardButton("🎬 Film", callback_data=f"mag:{key}:movies"),
-                ]
+                ],
+                [InlineKeyboardButton("✖️ Cancel", callback_data=f"close:{key}")],
             ]
         ),
     )
@@ -1476,6 +1484,22 @@ async def _do_search(
     )
 
 
+async def on_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Retire a prompt so its buttons can't be pressed later by accident."""
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, key = query_cb.data.split(":", 1)
+    # Drop the stored results too -- keeping them would leak memory for
+    # searches nobody is going to act on.
+    SEARCHES.pop(key, None)
+    context.bot_data.get("queries", {}).pop(key, None)
+    context.bot_data.get("pending_torrents", {}).pop(key, None)
+    context.bot_data.get("pending_magnets", {}).pop(key, None)
+
+    await query_cb.edit_message_text("✖️ Closed.")
+
+
 async def on_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query_cb = update.callback_query
     await query_cb.answer()
@@ -1503,7 +1527,8 @@ def _category_keyboard(key: str, index: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🎌 Anime", callback_data=f"go:{key}:{index}:anime"),
                 InlineKeyboardButton("📺 TV", callback_data=f"go:{key}:{index}:series"),
                 InlineKeyboardButton("🎬 Film", callback_data=f"go:{key}:{index}:movies"),
-            ]
+            ],
+            [InlineKeyboardButton("✖️ Cancel", callback_data=f"close:{key}")],
         ]
     )
 
@@ -1756,6 +1781,7 @@ def main() -> None:
     app.add_handler(
         MessageHandler(filters.Document.ALL & chat_filter, on_subtitle_file)
     )
+    app.add_handler(CallbackQueryHandler(on_close, pattern=r"^close:"))
     app.add_handler(CallbackQueryHandler(on_page, pattern=r"^page:"))
     app.add_handler(CallbackQueryHandler(on_pick, pattern=r"^pick:"))
     app.add_handler(CallbackQueryHandler(on_go, pattern=r"^go:"))
