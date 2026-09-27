@@ -176,10 +176,12 @@ SEASON_MARKERS = [
     # patterns own, and not a trailing letter of a word.
     re.compile(r"(?![\s._\-]+[Ss]\d{1,2}[Ee]\d)[\s._\-]+(?:ss|s)(\d{1,2})\b", re.I),
     # "Yuru Yuri TV 2" -- the unbracketed form, which is what the folder name
-    # actually looks like once a RuTracker release has been unpacked. Anchored
-    # to the end so a title that merely contains the word ("TV 2 Broadcast
-    # Edition") isn't misread.
-    re.compile(r"[\s._\-]+(?:TV|ТВ)[\s._\-]*(\d{1,2})$", re.I),
+    # actually looks like once a RuTracker release has been unpacked. Either
+    # at the end, or followed by what else the pack contains: a release
+    # labelled "TV-1 + SP + MV" is season 1 plus its specials.
+    re.compile(
+        r"[\s._\-]+(?:TV|ТВ)[\s._\-]*(\d{1,2})(?=$|[\s._\-]*\+)", re.I
+    ),
     # A bare trailing number: "Yuru Yuri 2". Last, and deliberately narrow --
     # a number is only a season when nothing else follows it.
     re.compile(r"[\s._\-]+(\d{1,2})$"),
@@ -269,10 +271,24 @@ def title_candidates(raw: str) -> list[str]:
     lets the importer prefer whichever one the library already knows.
     """
     head = RE_BRACKET_SEASON.sub(" ", raw)
+
+    # A Russian-titled release often carries the Latin name in brackets:
+    #
+    #   Жизнь в альтернативном мире с нуля [Re Zero kara Hajimeru ...] TV-1
+    #
+    # That bracket is the only thing tying it to the "Re Zero" folder the
+    # other seasons live in, so it is a candidate rather than noise. Taken
+    # before the leading-bracket strip below, which would discard it.
+    bracketed = [
+        b.strip()
+        for b in re.findall(r"\[([^\]]{4,80})\]", head)
+        if re.search(r"[A-Za-z]{3,}", b)
+    ]
+
     head = re.sub(r"^\s*\[[^\]]{1,30}\]\s*(?=\S)", "", head)
 
     seen: list[str] = []
-    for part in head.split("/"):
+    for part in head.split("/") + bracketed:
         part = part.strip()
         if not re.search(r"[A-Za-z]{3,}", part):
             continue
@@ -295,6 +311,12 @@ def title_and_season(raw: str) -> tuple[str, int | None]:
     # itself on top of season 1.
     bracketed = RE_BRACKET_SEASON.search(raw)
     tagged_season = int(bracketed.group(1)) if bracketed else None
+
+    # The unbracketed "TV-1" form sits past the title too, after the Latin
+    # name in brackets, so it has to be read from the whole string as well:
+    # cutting the title at the first "[" happens below and would hide it.
+    if tagged_season is None:
+        _, tagged_season = split_season(raw)
 
     # Fansub groups prefix their name in brackets ("[smol] YuruYuri ..."), and
     # leaving it in means Jellyfin and Bazarr both fail to identify the show.
@@ -670,6 +692,13 @@ def existing_folder(media_root: Path, title: str) -> str | None:
     Matching ignores spacing and punctuation, so a release that cleans up as
     "YuruYuri" joins the "Yuru Yuri" folder rather than starting a rival one
     next to it.
+
+    A release also names the show at full length where the library uses the
+    short form -- "Re Zero kara Hajimeru Isekai Seikatsu" against a folder
+    called "Re Zero". A folder whose key is a prefix of the title's counts,
+    so the long name joins the short folder instead of forking off. The
+    longest such folder wins, so "Re Zero" doesn't swallow a release that
+    matches "Re Zero Shorts" exactly.
     """
     key = match_key(title)
     if not key:
@@ -678,9 +707,28 @@ def existing_folder(media_root: Path, title: str) -> str | None:
         entries = sorted(p.name for p in media_root.iterdir() if p.is_dir())
     except OSError:
         return None
+
     for name in entries:
         if match_key(name) == key:
             return name
+
+    # Nothing exact. Fall back to a prefix match in either direction: the
+    # release may name the show longer than the folder does ("Re Zero kara
+    # Hajimeru Isekai Seikatsu" vs "Re Zero") or shorter, depending on which
+    # season arrived first. Only reasonably long keys, since a four-letter
+    # prefix would match half the library.
+    prefixes = [
+        name
+        for name in entries
+        if len(match_key(name)) >= 6
+        and (
+            key.startswith(match_key(name)) or match_key(name).startswith(key)
+        )
+    ]
+    if prefixes:
+        # Longest wins, so "Re Zero" doesn't swallow a release that matches
+        # "Re Zero Shorts" exactly.
+        return max(prefixes, key=lambda n: len(match_key(n)))
     return None
 
 
@@ -703,16 +751,29 @@ def import_download(
     """
     title, stated_season = title_and_season(release_name)
     if kind != "movies":
+        candidates = [title, *title_candidates(release_name)]
+
         # A sequel is posted under its own name ("Yuru Yuri San Hai") while
         # the same listing also carries the bare series name ("Yuruyuri").
         # If the library already has a folder under any of the names this
         # release offers, that folder is the show -- put the season there
         # rather than starting a second entry for the same series.
-        for candidate in [title, *title_candidates(release_name)]:
+        for candidate in candidates:
             match = existing_folder(media_root, candidate)
             if match:
                 title = match
                 break
+        else:
+            # Nothing on disk yet, so this release names the folder. Prefer a
+            # Latin name over a Cyrillic one: the other seasons will arrive
+            # under their Latin titles and have to find this folder, and
+            # metadata providers only know the show by that name anyway.
+            if not re.search(r"[A-Za-z]{3,}", title):
+                latin = next(
+                    (c for c in candidates if re.search(r"[A-Za-z]{3,}", c)), None
+                )
+                if latin:
+                    title = latin
     files, extras = _video_files(source)
     if not files and not extras:
         return ImportResult(title, media_root, 0, 0)
