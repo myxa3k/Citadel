@@ -279,6 +279,23 @@ Two numbering schemes often appear in one filename:
 13th of the whole run. The within-season number wins, since that is what the
 season folder is counted against.
 
+**The season tag is read from either kind of bracket.** RuTracker writes it
+beside the Russian title, usually in round ones:
+
+```
+Свободу Лесбиянкам (ТВ-2) / Yuru Yuri / Yuruyuri / YRYR / Лилии На Ветру [TV] [12 из 12]
+```
+
+Matching only `[TV-2]` meant every season parsed as *no season stated*, so all
+three were filed as Season 01 and each import silently overwrote the one
+before — 12 episodes on disk where there should have been 37.
+
+**A sequel joins the show it belongs to.** That same listing gives a sequel
+its own name first (`Yuru Yuri San Hai`) with the bare series name further
+along. Each Latin name is tried against the library, and the first that
+already has a folder wins — so season 3 lands in `Yuru Yuri` rather than
+starting a second entry for the same series.
+
 **Folders already split** are combined by `/merge`, and nothing about it is
 guessed — `San Hai` is the third season and `Nachuyachumi` is an OVA, and no
 rule can read that from either name. So you choose:
