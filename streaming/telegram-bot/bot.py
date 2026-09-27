@@ -1127,12 +1127,9 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if folder != parent:
             store.remove(folder)
 
-    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
-    if jellyfin is not None:
-        try:
-            await jellyfin.refresh_library()
-        except Exception:  # noqa: BLE001
-            log.exception("jellyfin refresh failed after merge")
+    # Folders were removed, so Jellyfin has to forget them rather than keep
+    # showing the merged-away entries with blank posters.
+    await _sync_jellyfin(context, forget=True)
 
     seasons = sorted({roles[f][1] for f in merging if roles[f][0] == "season"})
     text = (
@@ -1338,12 +1335,7 @@ async def on_reimport_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Re-importing means this torrent is no longer "already done".
         IMPORTED.discard(torrent.get("hash") or "")
 
-    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
-    if jellyfin is not None:
-        try:
-            await jellyfin.refresh_library()
-        except Exception:  # noqa: BLE001
-            log.exception("jellyfin refresh failed after reimport")
+    await _sync_jellyfin(context, forget=True)
 
     # The rebuild may have settled on a different folder name than the one
     # picked, if a release names the show more fully than the old folder did.
@@ -1383,6 +1375,42 @@ def _feeds_show(torrent: dict[str, Any], config: Config, show: str) -> bool:
         ):
             return True
     return False
+
+
+async def _sync_jellyfin(context: ContextTypes.DEFAULT_TYPE, forget: bool = False) -> None:
+    """Rescan, and optionally drop entries whose folder is gone.
+
+    `forget` belongs anywhere the bot has just removed a folder. Jellyfin
+    keeps an entry whose path vanished -- reasonable when a network share
+    drops out, wrong here -- and the leftover shows up as a second copy of
+    the series with no poster.
+    """
+    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
+    if jellyfin is None:
+        return
+
+    try:
+        await jellyfin.refresh_library()
+    except Exception:  # noqa: BLE001
+        log.exception("jellyfin refresh failed")
+        return
+
+    if not forget:
+        return
+
+    config: Config = context.bot_data["config"]
+    # Jellyfin reports the path as its own container sees it.
+    roots = {
+        ours.replace("/data/media", "/media"): ours
+        for ours in config.media_paths.values()
+    }
+    try:
+        removed = await jellyfin.forget_missing(roots)
+    except Exception:  # noqa: BLE001 - the rescan already happened
+        log.exception("could not clean up missing jellyfin entries")
+        return
+    if removed:
+        log.info("jellyfin forgot %s", ", ".join(removed))
 
 
 def _describe_folders(media_root: Path, name: str) -> str:
@@ -2034,12 +2062,7 @@ async def on_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     store: FollowStore = context.bot_data["follows"]
     store.remove(title)
 
-    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
-    if jellyfin is not None:
-        try:
-            await jellyfin.refresh_library()
-        except Exception:  # noqa: BLE001
-            log.exception("jellyfin refresh failed after delete")
+    await _sync_jellyfin(context, forget=True)
 
     await query_cb.edit_message_text(
         f"🗑 <b>{html.escape(title)}</b> deleted.\n"

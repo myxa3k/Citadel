@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
@@ -363,3 +364,59 @@ class JellyfinClient:
                 urljoin(self._base, "Library/Refresh"), headers=self._headers
             )
             resp.raise_for_status()
+
+    async def forget_missing(self, media_roots: dict[str, str]) -> list[str]:
+        """Drop series whose folder no longer exists.
+
+        A refresh alone does not do this. When a folder disappears entirely
+        Jellyfin treats it as temporarily unreachable and keeps the entry --
+        sensible for a network share that went down, wrong for a folder the
+        bot just deleted. The stale entry then sits in the library with a
+        blank poster, and /delete cannot help because the bot reads the disk,
+        where there is nothing left to list.
+
+        `media_roots` maps the path Jellyfin reports to the path this process
+        sees, since the two containers mount the same storage differently.
+
+        Returns the names of the series it removed.
+        """
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                urljoin(self._base, "Items"),
+                params={
+                    "Recursive": "true",
+                    "IncludeItemTypes": "Series",
+                    "Fields": "Path",
+                },
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+
+            removed: list[str] = []
+            for item in resp.json().get("Items", []):
+                path = item.get("Path") or ""
+                local = path
+                for theirs, ours in media_roots.items():
+                    if path.startswith(theirs):
+                        local = ours + path[len(theirs) :]
+                        break
+                else:
+                    # A path under no known root isn't ours to judge.
+                    continue
+
+                if Path(local).exists():
+                    continue
+
+                gone = await client.delete(
+                    urljoin(self._base, f"Items/{item['Id']}"),
+                    headers=self._headers,
+                )
+                if gone.is_success:
+                    removed.append(item.get("Name") or item["Id"])
+                else:
+                    log.warning(
+                        "jellyfin refused to forget %s (%s)",
+                        item.get("Name"),
+                        gone.status_code,
+                    )
+            return removed
