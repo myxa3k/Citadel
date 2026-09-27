@@ -501,6 +501,12 @@ def merge_shows(
     for folder in folders:
         source = media_root / folder
         role, number = roles.get(folder, ("season", 1))
+        # The show being merged *into* keeps what it already has. Walking its
+        # own files and refiling them under the role it was given moved every
+        # episode of Season 01 into Season 02 -- the same inodes appearing
+        # twice, one series looking like it had fifty episodes.
+        if source == target_root:
+            continue
         if not source.is_dir():
             continue
 
@@ -588,8 +594,6 @@ def merge_shows(
             except OSError as exc:
                 problems.append(f"{f.name}: {exc}")
 
-        if source == target_root:
-            continue
         # Only the now-empty shell goes. Anything left behind means a file
         # didn't move, and deleting the folder then would lose it.
         leftover = [p for p in source.rglob("*") if p.is_file()]

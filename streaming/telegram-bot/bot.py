@@ -937,7 +937,10 @@ async def on_merge_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         # Roles default to season 1, 2, 3 … in the order they were picked --
         # which is what the order was for. Everything stays adjustable.
+        # The first pick is the destination and keeps whatever seasons it
+        # already has, so it gets no role of its own to change.
         roles = {folders[i][1]: ("season", n + 1) for n, i in enumerate(chosen)}
+        roles[folders[chosen[0]][1]] = ("keep", 0)
         context.bot_data["merge_plan"] = {
             "kind": folders[chosen[0]][0],
             "parent": folders[chosen[0]][1],
@@ -974,6 +977,9 @@ ROLE_LABELS = {
     "specials": "🎪 Specials",
     "extras": "🎬 Extras",
     "skip": "⏭ skip",
+    # The destination folder. Not a role you can set -- it is where everything
+    # else is going, and its own seasons stay exactly as they are.
+    "keep": "📁 destination",
 }
 
 
@@ -987,6 +993,9 @@ def _role_label(role: tuple[str, int]) -> str:
 def _cycle_role(role: tuple[str, int]) -> tuple[str, int]:
     """season 1 → 2 → … → 9 → specials → extras → skip → season 1."""
     kind, number = role
+    if kind == "keep":
+        # The destination doesn't move anywhere, so there is nothing to cycle.
+        return role
     if kind == "season":
         return ("season", number + 1) if number < 9 else ("specials", 0)
     if kind == "specials":
@@ -1030,6 +1039,7 @@ async def _show_merge_plan(query_cb: Any, plan: dict[str, Any]) -> None:
     note = (
         "Tap a row to change what it is: seasons 1–9, then Specials "
         "(OVAs and shorts), Extras (openings, adverts), then skip.\n\n"
+        "📁 is the destination — it keeps the seasons it already has.\n"
         "Episodes are moved, not copied — the torrents keep seeding."
     )
     if clash:
