@@ -1938,7 +1938,8 @@ async def on_magnet_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await qbit.add(link, category=CATEGORY, savepath=savepath)
     except TorrentNotAdded:
         await query_cb.edit_message_text(
-            "ℹ️ Already downloaded — this release is here under another name."
+            await _already_have(context, link),
+            parse_mode=ParseMode.HTML,
         )
         return
     except Exception as exc:  # noqa: BLE001
@@ -1949,6 +1950,44 @@ async def on_magnet_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query_cb.edit_message_text(
         f"✅ Queued\n📁 {html.escape(savepath or '?')}\n\nProgress — /status",
         parse_mode=ParseMode.HTML,
+    )
+
+
+async def _already_have(context: ContextTypes.DEFAULT_TYPE, link: str) -> str:
+    """Explain what the torrent you just pasted already is.
+
+    "Already downloaded" on its own leaves you wondering *what* it matched
+    and whether it finished -- the infohash is in the magnet, so the answer
+    is one lookup away.
+    """
+    match = re.search(r"btih:([0-9a-fA-F]{40}|[2-7A-Za-z]{32})", link)
+    if match is None:
+        return "ℹ️ Already here — qBittorrent has this torrent under another name."
+
+    wanted = match.group(1).lower()
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    try:
+        torrents = await qbit.torrents()
+    except Exception:  # noqa: BLE001 - the useful half of the answer stands
+        log.exception("could not look up the existing torrent")
+        return "ℹ️ Already here — qBittorrent has this torrent under another name."
+
+    existing = next(
+        (t for t in torrents if (t.get("hash") or "").lower() == wanted), None
+    )
+    if existing is None:
+        return "ℹ️ Already here — qBittorrent has this torrent under another name."
+
+    name = html.escape((existing.get("name") or "?")[:120])
+    progress = (existing.get("progress") or 0) * 100
+    if progress >= 100:
+        return (
+            f"ℹ️ Already here\n\n<b>{name}</b>\n\n"
+            "Downloaded and seeding — watch it in Jellyfin, or see /library."
+        )
+    return (
+        f"ℹ️ Already here\n\n<b>{name}</b>\n\n"
+        f"Still downloading — {progress:.0f}%. Watch it with /status."
     )
 
 

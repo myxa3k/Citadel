@@ -200,6 +200,15 @@ class QBittorrentClient:
         if resp.status_code == 403:
             await self._login(client)
             resp = await client.post(endpoint, data=data, files=files)
+        # 409 is qBittorrent's way of saying it already has this infohash.
+        # That is the ordinary "you already downloaded this" case, not a
+        # failure -- raising the raw HTTP error showed the user a stack
+        # trace and an MDN link for what is really a one-line answer.
+        if resp.status_code == 409:
+            raise TorrentNotAdded(
+                "qBittorrent already has this torrent — it is downloaded, "
+                "or downloading, under another name"
+            )
         resp.raise_for_status()
 
         # Adding is asynchronous -- the torrent appears a moment later, so
