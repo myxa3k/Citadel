@@ -28,6 +28,11 @@ SUBTITLE_SUFFIXES = {".ass", ".srt", ".ssa", ".sub", ".vtt"}
 # Below this, a file is a sample, a trailer, or a stray extra rather than an
 # episode worth putting in the library.
 MIN_VIDEO_BYTES = 50 * 1024 * 1024
+# Specials are exempt from that floor, and need one of their own. A shorts
+# series runs three to five minutes an episode -- Re:Zero's "Break Time" and
+# "Re Puchi" are around 40 MB each -- so the ordinary threshold discarded
+# twenty of twenty-five without a word. They are still real episodes.
+MIN_SPECIAL_BYTES = 2 * 1024 * 1024
 
 # Extras that ship inside a season pack and are not episodes: creditless
 # openings and endings, adverts, previews, art galleries, menus.
@@ -223,7 +228,11 @@ def split_season(raw: str) -> tuple[str, int | None]:
         # resolution that slipped through rather than a season.
         if not 1 <= season <= 40:
             continue
-        stripped = (raw[: m.start()] + raw[m.end() :]).strip(" -_.")
+        rest = raw[m.end() :]
+        # "TV-1 + SP + MV" lists what else is in the pack, not more title.
+        # Everything from the "+" onwards belongs to the season marker.
+        rest = re.sub(r"^\s*\+.*$", "", rest)
+        stripped = (raw[: m.start()] + rest).strip(" -_.")
         # Only if something is left: "S2" alone is not a title.
         if stripped:
             return stripped, season
@@ -680,7 +689,12 @@ def _video_files(source: Path) -> tuple[list[Path], list[Path]]:
     for p in sorted(source.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in VIDEO_SUFFIXES:
             continue
-        if p.stat().st_size < MIN_VIDEO_BYTES:
+        floor = (
+            MIN_SPECIAL_BYTES
+            if is_special(p.name, _relative_to(p, source))
+            else MIN_VIDEO_BYTES
+        )
+        if p.stat().st_size < floor:
             continue
         (extras if is_extra(p.name) else episodes).append(p)
     return episodes, extras
