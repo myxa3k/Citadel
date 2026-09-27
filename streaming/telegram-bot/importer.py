@@ -54,6 +54,45 @@ def is_extra(name: str) -> bool:
     return EXTRA_MARKERS.search(Path(name).stem) is not None
 
 
+# A special: a real episode, but one that belongs in Season 00 rather than
+# numbered among the season it shipped with. Russian packs write it inline,
+# keeping the absolute position in the bracket:
+#
+#   [07] Yuru Yuri TV 1 Sp 1 серия.mkv
+#
+# which parses as "episode 1" -- the same slot as the actual first episode.
+# Whichever sorts first wins and the other is dropped, so the special was
+# silently lost. Recognising it sends it to Season 00 instead, where it has
+# its own numbering and collides with nothing.
+SPECIAL_MARKERS = re.compile(
+    r"(?:^|[\s._\-\[(])(?:"
+    r"Sp(?:ecial)?s?|SP|OVA|ONA|OAD|Спешл|Спецвыпуск"
+    r")(?:[\s._\-\])]|\d|$)",
+    re.IGNORECASE,
+)
+
+
+def is_special(name: str) -> bool:
+    """Whether a filename is a special/OVA rather than a numbered episode."""
+    stem = Path(name).stem
+    if is_extra(stem):
+        return False
+    return SPECIAL_MARKERS.search(stem) is not None
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """Whether two paths are the same data -- a hardlink of each other.
+
+    Re-running an import must not treat the entry it made last time as a
+    rival file needing a new number, or every run would add another copy.
+    """
+    try:
+        sa, sb = a.stat(), b.stat()
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
 # Episode number as release groups actually write it, most specific first.
 # "S01E05" and "- 05 -" are unambiguous; a bare leading "05." is the common
 # fallback in Russian anime packs.
@@ -614,9 +653,14 @@ def import_download(
 
     for f in files:
         parsed = episode_number(f.name) or episode_number(f.parent.name)
+        # A special shipped inline with the season ("... Sp 1 серия") numbers
+        # itself from 1 and would land on top of the real first episode.
+        # Season 00 is where it belongs and where nothing competes with it.
+        if is_special(f.name):
+            parsed = (0, parsed[1] if parsed else 1)
         # "Yuru Yuri ss2 - 05.mkv" numbers the episode but not the season;
         # the season came from the release title, so put it back.
-        if parsed is not None and stated_season is not None and parsed[0] == 1:
+        elif parsed is not None and stated_season is not None and parsed[0] == 1:
             parsed = (stated_season, parsed[1])
         if parsed is None:
             # Unnumbered: keep it rather than drop it, and let Jellyfin sort
@@ -630,6 +674,16 @@ def import_download(
             destination = show_root / f"Season {season:02d}"
             destination.mkdir(parents=True, exist_ok=True)
             target = destination / f"{title} - S{season:02d}E{episode:02d}{f.suffix}"
+            # Two files claiming one slot: take the next free number rather
+            # than dropping one of them. Silently skipping is how the season 1
+            # special disappeared without ever appearing in the library.
+            if target.exists() and not _same_file(target, f):
+                probe = episode
+                while target.exists() and probe < 200:
+                    probe += 1
+                    target = destination / (
+                        f"{title} - S{season:02d}E{probe:02d}{f.suffix}"
+                    )
 
         if target.exists():
             skipped += 1
