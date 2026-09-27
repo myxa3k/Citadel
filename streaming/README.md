@@ -267,29 +267,43 @@ the show before making a new one, comparing on letters and digits alone — so
 from firing on titles that merely end in a number: `Steins;Gate 0`,
 `Mob Psycho 100` and `86 Eighty Six` are left alone.
 
-**Folders already split** are repaired by `/merge`. It looks for folders whose
-names share a prefix — compared on letters and digits alone, so `YuruYuri` and
-`Yuru Yuri San Hai` group together despite the spacing — and shows an
-**editable** plan:
+**Bonus features are separated from episodes.** A RuTracker season pack ships
+creditless openings, adverts and art galleries alongside the episodes, named
+`Yuru Yuri TV 2 Art Design 1.mkv` and `CM 2.mkv`. Those parse as *episode 1*
+and *episode 2* and overwrite the real ones — which is how one series became
+three broken entries in Jellyfin. They now go to `extras/`, the folder
+Jellyfin shows as bonus features and never numbers as episodes.
+
+Two numbering schemes often appear in one filename:
+`[13] Yuru Yuri TV 1 12 серия.mkv` is episode **12** of season 1 and also the
+13th of the whole run. The within-season number wins, since that is what the
+season folder is counted against.
+
+**Folders already split** are combined by `/merge`, and nothing about it is
+guessed — `San Hai` is the third season and `Nachuyachumi` is an OVA, and no
+rule can read that from either name. So you choose:
+
+1. **Pick the folders.** Every library folder is listed with its video count.
+   Tap the ones that are one show; the first you pick is what the rest merge
+   into. `/merge yuru` narrows a long list.
+2. **Say what each one is.** Tap a row to cycle it: seasons 1–9, then
+   **Specials** (`Season 00` — where Jellyfin files OVAs and shorts, shown
+   after the seasons rather than inside them), then **Extras** (`extras/`),
+   then **skip**, which leaves that folder alone.
 
 ```
-Merge into YuruYuri:
+Merge into Yuru Yuri:
 
-  • YuruYuri          → Season 01
-  • YuruYuri ss2      → Season 02
-  • Yuru Yuri San Hai → Season 03
-  • Yuru Yuri Ten     → Specials
+  • Yuru Yuri               → Season 01
+  • Yuru Yuri San Hai       → Season 03
+  • Yuru Yuri Nachuyachumi! → 🎪 Specials
+  • Yuru Yuri Ten           → 🎪 Specials
 ```
 
-Every row is a button. Tapping one cycles its season: 1, 2, 3 … 9, then
-**Specials** (`Season 00`, where Jellyfin expects OVAs and shorts), then
-**skip** — which leaves that folder untouched, because a spin-off like
-`Oomuro-ke` is its own show and not a season of anything.
-
-The numbers only get guessed where a folder name states one. `San Hai` and
-`Ten` carry no number, so the guess falls back to alphabetical order and is
-usually wrong — which is exactly why the plan is editable rather than a
-yes/no confirmation.
+Merge stays disabled until the plan is coherent: two folders set to the same
+season is flagged rather than silently merged, and skipping everything leaves
+nothing to do. Two OVA batches both numbered from 1 don't collide — the second
+takes the next free slot in Season 00 instead of being dropped.
 
 Episodes are **moved, not copied**. They're hardlinks into the download, so a
 move keeps the same inode and every torrent carries on seeding from the same

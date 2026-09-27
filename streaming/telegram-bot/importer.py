@@ -29,6 +29,31 @@ SUBTITLE_SUFFIXES = {".ass", ".srt", ".ssa", ".sub", ".vtt"}
 # episode worth putting in the library.
 MIN_VIDEO_BYTES = 50 * 1024 * 1024
 
+# Extras that ship inside a season pack and are not episodes: creditless
+# openings and endings, adverts, previews, art galleries, menus.
+#
+# These matter more than their size suggests. "Yuru Yuri TV 2 Art Design 1"
+# parses as episode 1 and "CM 2" as episode 2, so without this they overwrite
+# the real first and second episodes in the library -- which is precisely how
+# one series ended up as three broken entries in Jellyfin. A creditless
+# opening is also often a full-size 1080p file, so a size threshold alone
+# never catches them.
+EXTRA_MARKERS = re.compile(
+    r"(?:^|[\s._\-\[(])(?:"
+    r"NC(?:OP|ED)|(?:OP|ED)\s*\d*(?:v\d)?|Creditless"
+    r"|CM|PV|SPOT|Trailer|Teaser|Promo|Preview"
+    r"|Art[\s._\-]?Design|Menu|Logo|Interview|Making|Web[\s._\-]?Preview"
+    r"|Clean[\s._\-]?(?:Opening|Ending)"
+    r")(?:[\s._\-\])]|\d|$)",
+    re.IGNORECASE,
+)
+
+
+def is_extra(name: str) -> bool:
+    """Whether a filename is a bonus feature rather than an episode."""
+    return EXTRA_MARKERS.search(Path(name).stem) is not None
+
+
 # Episode number as release groups actually write it, most specific first.
 # "S01E05" and "- 05 -" are unambiguous; a bare leading "05." is the common
 # fallback in Russian anime packs.
@@ -81,6 +106,11 @@ SEASON_MARKERS = [
     # "ss2", "S2" as a standalone token -- not "S02E01", which the episode
     # patterns own, and not a trailing letter of a word.
     re.compile(r"(?![\s._\-]+[Ss]\d{1,2}[Ee]\d)[\s._\-]+(?:ss|s)(\d{1,2})\b", re.I),
+    # "Yuru Yuri TV 2" -- the unbracketed form, which is what the folder name
+    # actually looks like once a RuTracker release has been unpacked. Anchored
+    # to the end so a title that merely contains the word ("TV 2 Broadcast
+    # Edition") isn't misread.
+    re.compile(r"[\s._\-]+(?:TV|ТВ)[\s._\-]*(\d{1,2})$", re.I),
     # A bare trailing number: "Yuru Yuri 2". Last, and deliberately narrow --
     # a number is only a season when nothing else follows it.
     re.compile(r"[\s._\-]+(\d{1,2})$"),
@@ -343,67 +373,19 @@ def attach_subtitles(
     return attached, unmatched
 
 
-def suggest_merges(media_root: Path) -> list[tuple[str, list[str]]]:
-    """Folders in one library that look like seasons of the same show.
-
-    Buying each season as its own tracker release is the normal way to get an
-    anime that ran over several years, and it leaves the library with one
-    folder per release. This finds the sets worth collapsing: folders whose
-    names agree on a prefix long enough to be a title rather than a
-    coincidence.
-
-    Returns (suggested parent title, folder names) for each group, so the
-    caller can confirm before anything moves.
-    """
-    try:
-        raw = [p.name for p in media_root.iterdir() if p.is_dir()]
-    except OSError:
-        return []
-
-    # Sorted by the normalised key, not the raw name, so the bare title always
-    # comes before the titles built on top of it. Sorting by raw name puts
-    # "YuruYuri" *after* "Yuru Yuri San Hai" -- a space sorts before a letter
-    # -- and the shortest name is then never the one that gets to collect the
-    # others, which is how a real group silently went unfound.
-    names = sorted(raw, key=lambda n: (match_key(n), n))
-
-    groups: list[tuple[str, list[str]]] = []
-    used: set[str] = set()
-
-    for i, name in enumerate(names):
-        if name in used:
-            continue
-        base = match_key(name)
-        if len(base) < 4:
-            # Too short to distinguish a real shared title from two unrelated
-            # shows that happen to start alike.
-            continue
-
-        members = [name]
-        for other in names[i + 1 :]:
-            if other in used:
-                continue
-            key = match_key(other)
-            # One is a prefix of the other: "yuruyuri" against
-            # "yuruyurisanhai". That's the shape a sequel's title takes --
-            # the original plus a subtitle.
-            if key.startswith(base) and len(key) > len(base):
-                members.append(other)
-
-        if len(members) > 1:
-            used.update(members)
-            # The shortest *key* is the bare series title; the others are it
-            # plus a season subtitle. Measured on the key so that spacing
-            # doesn't decide which folder name the merged show ends up under.
-            groups.append((min(members, key=lambda n: len(match_key(n))), members))
-
-    return groups
-
 
 def merge_shows(
-    media_root: Path, parent: str, folders: list[str], seasons: dict[str, int]
+    media_root: Path,
+    parent: str,
+    folders: list[str],
+    roles: dict[str, tuple[str, int]],
 ) -> tuple[int, list[str]]:
-    """Fold several show folders into one, each as its own season.
+    """Fold several show folders into one, each in the role it was given.
+
+    `roles` maps a folder to ("season", N), ("specials", 0) or
+    ("extras", 0) -- the three places Jellyfin reads differently. Specials
+    become Season 00, where OVAs and shorts belong; extras go to `extras/`,
+    which Jellyfin shows as bonus features and never numbers as episodes.
 
     Files are *moved*, not copied -- they are hardlinks into the download, so
     moving one keeps the same inode and the torrent keeps seeding from it
@@ -418,7 +400,7 @@ def merge_shows(
 
     for folder in folders:
         source = media_root / folder
-        season = seasons.get(folder, 1)
+        role, number = roles.get(folder, ("season", 1))
         if not source.is_dir():
             continue
 
@@ -426,25 +408,50 @@ def merge_shows(
             if not f.is_file():
                 continue
 
-            parsed = episode_number(f.name) or episode_number(f.parent.name)
-            episode = parsed[1] if parsed else None
-
-            destination = target_root / f"Season {season:02d}"
-            destination.mkdir(parents=True, exist_ok=True)
-
-            if episode is None:
-                # No number to file it under; keep the original name so
-                # nothing is silently lost.
+            # A bonus feature keeps its own name wherever it lands: numbering
+            # it as an episode is exactly the mistake that made one series
+            # look like three.
+            if role == "extras" or is_extra(f.name):
+                destination = target_root / "extras"
+                destination.mkdir(parents=True, exist_ok=True)
                 target = destination / f.name
             else:
-                # Subtitles carry a language part before the extension that
-                # has to survive the rename, or Jellyfin stops matching them.
-                suffix = f.suffix
-                if suffix.lower() in SUBTITLE_SUFFIXES:
-                    lang = f.stem.rsplit(".", 1)
-                    if len(lang) == 2 and 1 <= len(lang[1]) <= 8:
-                        suffix = f".{lang[1]}{suffix}"
-                target = destination / f"{parent} - S{season:02d}E{episode:02d}{suffix}"
+                season = 0 if role == "specials" else number
+                parsed = episode_number(f.name) or episode_number(f.parent.name)
+                episode = parsed[1] if parsed else None
+
+                destination = target_root / f"Season {season:02d}"
+                destination.mkdir(parents=True, exist_ok=True)
+
+                if episode is None:
+                    # No number to file it under; keep the original name so
+                    # nothing is silently lost.
+                    target = destination / f.name
+                else:
+                    # Subtitles carry a language part before the extension
+                    # that has to survive the rename, or Jellyfin stops
+                    # matching them to the video.
+                    suffix = f.suffix
+                    if suffix.lower() in SUBTITLE_SUFFIXES:
+                        lang = f.stem.rsplit(".", 1)
+                        if len(lang) == 2 and 1 <= len(lang[1]) <= 8:
+                            suffix = f".{lang[1]}{suffix}"
+                    target = (
+                        destination
+                        / f"{parent} - S{season:02d}E{episode:02d}{suffix}"
+                    )
+                    # Two OVA batches both numbered from 1 collide in
+                    # Season 00. Take the next free slot rather than skipping
+                    # the file, which would leave it stranded in a folder the
+                    # merge then refuses to remove.
+                    if season == 0 and target.exists():
+                        probe = episode
+                        while target.exists() and probe < 200:
+                            probe += 1
+                            target = (
+                                destination
+                                / f"{parent} - S00E{probe:02d}{suffix}"
+                            )
 
             if target.exists():
                 continue
@@ -469,16 +476,22 @@ def merge_shows(
     return moved, problems
 
 
-def _video_files(source: Path) -> list[Path]:
+def _video_files(source: Path) -> tuple[list[Path], list[Path]]:
+    """Split a download's videos into (episodes, extras)."""
     if source.is_file():
-        return [source] if source.suffix.lower() in VIDEO_SUFFIXES else []
-    return sorted(
-        p
-        for p in source.rglob("*")
-        if p.is_file()
-        and p.suffix.lower() in VIDEO_SUFFIXES
-        and p.stat().st_size >= MIN_VIDEO_BYTES
-    )
+        if source.suffix.lower() not in VIDEO_SUFFIXES:
+            return [], []
+        return ([], [source]) if is_extra(source.name) else ([source], [])
+
+    episodes: list[Path] = []
+    extras: list[Path] = []
+    for p in sorted(source.rglob("*")):
+        if not p.is_file() or p.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        if p.stat().st_size < MIN_VIDEO_BYTES:
+            continue
+        (extras if is_extra(p.name) else episodes).append(p)
+    return episodes, extras
 
 
 def existing_folder(media_root: Path, title: str) -> str | None:
@@ -513,20 +526,26 @@ def import_download(
     A season named in the release title ("... ss2") is applied to the
     episodes, and an existing folder for the same show is reused, so seasons
     downloaded separately still end up as one series.
+
+    Creditless openings, adverts and art galleries are filed under `extras/`
+    rather than as episodes -- they parse as episode numbers ("Art Design 1")
+    and would otherwise overwrite the real ones.
     """
     title, stated_season = title_and_season(release_name)
     if kind != "movies":
         # Reuse the spelling already on disk, so the folder doesn't fork over
         # a difference in spacing.
         title = existing_folder(media_root, title) or title
-    files = _video_files(source)
-    if not files:
+    files, extras = _video_files(source)
+    if not files and not extras:
         return ImportResult(title, media_root, 0, 0)
 
     subtitles = _subtitle_files(source)
     linked = skipped = 0
 
     if kind == "movies":
+        if not files:
+            return ImportResult(title, media_root, 0, 0)
         destination = media_root / title
         destination.mkdir(parents=True, exist_ok=True)
         # A film release is one feature plus extras; the largest file is it.
@@ -578,5 +597,22 @@ def import_download(
         # Subtitles are linked even when the video was already there, so an
         # episode imported before this feature existed still picks them up.
         linked += _link_subtitles(subtitles, target, f)
+
+    # "extras" is the folder name Jellyfin recognises for bonus features: it
+    # shows them on the series page without ever treating one as an episode.
+    if extras:
+        bonus = show_root / "extras"
+        bonus.mkdir(parents=True, exist_ok=True)
+        for f in extras:
+            target = bonus / f.name
+            if target.exists():
+                skipped += 1
+                continue
+            try:
+                target.hardlink_to(f)
+                linked += 1
+            except OSError:
+                log.exception("could not hardlink extra %s", f)
+                skipped += 1
 
     return ImportResult(title, show_root, linked, skipped)

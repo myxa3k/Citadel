@@ -58,13 +58,12 @@ from clients import (
 from following import Followed, FollowStore
 from importer import (
     SUBTITLE_SUFFIXES,
+    VIDEO_SUFFIXES,
     attach_subtitles,
     clean_title,
     import_download,
     match_key,
     merge_shows,
-    split_season,
-    suggest_merges,
 )
 from ranking import Scored, rank
 from titles import alternative_titles
@@ -233,7 +232,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Library</b>\n"
         "/library — what's on the server\n"
         "/delete — remove a show and its torrent\n"
-        "/merge — join split seasons into one show\n"
+        "/merge — combine folders into one show, seasons your choice\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
         "<b>Adding things myself</b>\n"
@@ -777,217 +776,273 @@ async def cmd_library(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-def _merge_candidates(config: Config) -> list[tuple[str, str, list[str]]]:
-    """Groups of folders across the library that look like one show."""
-    found: list[tuple[str, str, list[str]]] = []
-    for kind in ("anime", "series"):
-        root = config.media_paths.get(kind)
-        if not root:
-            continue
-        for parent, folders in suggest_merges(Path(root)):
-            found.append((kind, parent, folders))
-    return found
-
-
-def _propose_seasons(parent: str, folders: list[str]) -> dict[str, int]:
-    """Guess which season each folder holds.
-
-    A number in the folder name is the best evidence -- the importer strips
-    seasons now, but these folders predate that. Failing that, the bare
-    series title is season 1 and the rest follow in alphabetical order,
-    which for a numbered franchise is usually release order too.
-    """
-    seasons: dict[str, int] = {}
-    unnumbered: list[str] = []
-
-    for folder in folders:
-        # Reuse the same markers the importer uses, against the part of the
-        # name that isn't the shared title.
-        _, season = split_season(folder)
-        if season is not None:
-            seasons[folder] = season
-        elif folder == parent:
-            seasons[folder] = 1
-        else:
-            unnumbered.append(folder)
-
-    # Fill the gaps with whatever numbers are still free, in order.
-    taken = set(seasons.values())
-    nxt = 1
-    for folder in sorted(unnumbered):
-        while nxt in taken:
-            nxt += 1
-        seasons[folder] = nxt
-        taken.add(nxt)
-
-    return seasons
-
 
 async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fold separately-downloaded seasons of one show into a single entry.
+    """Combine several library folders into one show, seasons chosen by hand.
 
-    Downloading each season as its own tracker release -- the only option on
-    RuTracker, where every season is a separate posting -- leaves the library
-    with one folder per release instead of one per show.
+    RuTracker posts each season as its own release, so a series bought in
+    full arrives as one folder per season plus one per OVA batch. Guessing
+    which is which from the names alone is unreliable -- "San Hai" is the
+    third season and "Nachuyachumi" is an OVA, and nothing in either name
+    says so. So nothing is guessed: you pick the folders, then say what each
+    one is.
     """
     config: Config = context.bot_data["config"]
     if not _authorised(config, update):
         return
 
-    groups = await asyncio.to_thread(_merge_candidates, config)
-    if not groups:
+    wanted = " ".join(context.args).strip().lower() if context.args else ""
+    folders = await asyncio.to_thread(_mergeable_folders, config, wanted)
+
+    if len(folders) < 2:
         await update.effective_message.reply_text(
-            "Nothing looks like it needs merging — every show is one folder.\n\n"
-            "If two folders belong together but have unrelated names, "
-            "rename one in Jellyfin's file browser so it starts with the "
-            "other's title, then run /merge again."
+            "Nothing to merge — I need at least two folders.\n\n"
+            "<code>/merge yuru</code> narrows the list to matching names.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    context.bot_data["merge_groups"] = groups
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"🔗 {parent[:30]} ({len(folders)})", callback_data=f"merge:{i}"
-            )
-        ]
-        for i, (_, parent, folders) in enumerate(groups[:10])
-    ]
-    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="merge:cancel")])
-
-    listing = "\n\n".join(
-        f"<b>{html.escape(parent)}</b>\n"
-        + "\n".join(f"  • {html.escape(f)}" for f in folders)
-        for _, parent, folders in groups[:10]
-    )
+    # Fresh selection each time: a half-finished one from an hour ago is
+    # more confusing than starting over.
+    context.bot_data["merge_pick"] = {
+        "folders": folders,
+        "chosen": [],
+        "query": wanted,
+    }
     await update.effective_message.reply_text(
-        f"These look like seasons of the same show:\n\n{listing}\n\n"
-        "Merging moves the episodes into one folder, each as its own season. "
-        "Seeding is unaffected.",
+        _merge_pick_text(folders, [], wanted),
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(rows),
+        reply_markup=_merge_pick_keyboard(folders, []),
     )
 
 
-async def on_merge_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _mergeable_folders(config: Config, query: str = "") -> list[tuple[str, str, int]]:
+    """Every episode folder in the library: (kind, name, video count)."""
+    found: list[tuple[str, str, int]] = []
+    for kind in ("anime", "series"):
+        root = config.media_paths.get(kind)
+        if not root or not Path(root).is_dir():
+            continue
+        for item in sorted(Path(root).iterdir()):
+            if not item.is_dir():
+                continue
+            if query and query not in item.name.lower():
+                continue
+            videos = sum(
+                1
+                for f in item.rglob("*")
+                if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES
+            )
+            found.append((kind, item.name, videos))
+    return found
+
+
+def _merge_pick_text(
+    folders: list[tuple[str, str, int]], chosen: list[int], query: str
+) -> str:
+    header = "🔗 <b>Merge</b> — pick the folders that are one show.\n"
+    if query:
+        header = f"🔗 <b>Merge</b> — matching “{html.escape(query)}”.\n"
+
+    if not chosen:
+        return (
+            header + "\nTap each folder that belongs together. "
+            "The first one you pick is the one the rest merge into."
+        )
+
+    picked = "\n".join(
+        f"  {n + 1}. {html.escape(folders[i][1])}" for n, i in enumerate(chosen)
+    )
+    return (
+        header + f"\n<b>Chosen, in order:</b>\n{picked}\n\n"
+        f"Merging into <b>{html.escape(folders[chosen[0]][1])}</b>. "
+        "Pick more, or press Next to say what each one is."
+    )
+
+
+def _merge_pick_keyboard(
+    folders: list[tuple[str, str, int]], chosen: list[int]
+) -> InlineKeyboardMarkup:
+    rows = []
+    for i, (_, name, videos) in enumerate(folders[:20]):
+        if i in chosen:
+            mark = f"{chosen.index(i) + 1}⃣"
+        else:
+            mark = "▫️"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark} {name[:30]} · {videos}", callback_data=f"mpick:{i}"
+                )
+            ]
+        )
+    if len(chosen) >= 2:
+        rows.append([InlineKeyboardButton("➡️ Next", callback_data="mpick:next")])
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="mpick:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def on_merge_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle a folder in or out of the selection."""
     query_cb = update.callback_query
     await query_cb.answer()
 
-    _, choice = query_cb.data.split(":", 1)
-    if choice == "cancel":
-        await query_cb.edit_message_text("Left as they are.")
-        return
-
-    groups = context.bot_data.get("merge_groups", [])
-    try:
-        kind, parent, folders = groups[int(choice)]
-    except (ValueError, IndexError):
+    _, action = query_cb.data.split(":", 1)
+    state = context.bot_data.get("merge_pick")
+    if state is None:
         await query_cb.edit_message_text("That list has expired — /merge again.")
         return
 
-    seasons = _propose_seasons(parent, folders)
-    context.bot_data["merge_confirm"] = (kind, parent, folders, seasons)
-    await _show_merge_plan(query_cb, parent, folders, seasons)
+    if action == "cancel":
+        context.bot_data.pop("merge_pick", None)
+        await query_cb.edit_message_text("Left as they are.")
+        return
 
+    folders: list[tuple[str, str, int]] = state["folders"]
+    chosen: list[int] = state["chosen"]
 
-# Season a folder is parked at to mean "leave this one alone". Spin-offs and
-# shorts are their own show in every metadata provider -- Oomuro-ke is not a
-# season of Yuru Yuri -- so excluding one has to be as easy as renumbering it.
-SKIP = -1
-# Jellyfin reads Season 00 as the specials folder, which is what OVAs and
-# shorts attached to a series actually are.
-SPECIALS = 0
+    if action == "next":
+        if len(chosen) < 2:
+            await query_cb.answer("Pick at least two.", show_alert=True)
+            return
+        kinds = {folders[i][0] for i in chosen}
+        if len(kinds) > 1:
+            await query_cb.edit_message_text(
+                "Those folders live in different libraries (anime and series), "
+                "so merging them would move files across roots. Move one in "
+                "the file browser first, then /merge."
+            )
+            return
+        # Roles default to season 1, 2, 3 … in the order they were picked --
+        # which is what the order was for. Everything stays adjustable.
+        roles = {folders[i][1]: ("season", n + 1) for n, i in enumerate(chosen)}
+        context.bot_data["merge_plan"] = {
+            "kind": folders[chosen[0]][0],
+            "parent": folders[chosen[0]][1],
+            "folders": [folders[i][1] for i in chosen],
+            "roles": roles,
+        }
+        await _show_merge_plan(query_cb, context.bot_data["merge_plan"])
+        return
 
+    index = int(action)
+    if index in chosen:
+        chosen.remove(index)
+    else:
+        chosen.append(index)
 
-def _season_label(season: int) -> str:
-    if season == SKIP:
-        return "skip"
-    if season == SPECIALS:
-        return "Specials"
-    return f"Season {season:02d}"
-
-
-async def _show_merge_plan(
-    query_cb: Any, parent: str, folders: list[str], seasons: dict[str, int]
-) -> None:
-    """The editable plan: one row per folder, tap to change its season.
-
-    Guessing the order from folder names only works when they're numbered.
-    "San Hai" and "Nachuyachumi" carry no number at all, so the guess is
-    alphabetical and usually wrong -- which would be fine if it weren't the
-    one screen standing between a wrong guess and files moving. Hence every
-    number is adjustable before anything happens.
-    """
-    ordered = sorted(folders, key=lambda f: (seasons[f] == SKIP, seasons[f], f))
-
-    plan = "\n".join(
-        f"  • {html.escape(f)} → <b>{_season_label(seasons[f])}</b>"
-        if seasons[f] != SKIP
-        else f"  • <s>{html.escape(f)}</s> → left alone"
-        for f in ordered
+    await query_cb.edit_message_text(
+        _merge_pick_text(folders, chosen, state["query"]),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_merge_pick_keyboard(folders, chosen),
     )
-    moving = sum(1 for f in folders if seasons[f] != SKIP)
+
+
+# What a folder can be. Jellyfin treats each differently, and getting this
+# right is the difference between a clean series page and one where the OVAs
+# are numbered as if they were the next season.
+#
+#   season N -- Season NN/, the ordinary case
+#   specials -- Season 00/, where Jellyfin files OVAs, shorts and side
+#               stories; they show up after the seasons, not inside them
+#   extras   -- extras/, bonus features that are never episodes: creditless
+#               openings, adverts, art galleries
+#   skip     -- left exactly where it is
+ROLE_LABELS = {
+    "specials": "🎪 Specials",
+    "extras": "🎬 Extras",
+    "skip": "⏭ skip",
+}
+
+
+def _role_label(role: tuple[str, int]) -> str:
+    kind, number = role
+    if kind == "season":
+        return f"Season {number:02d}"
+    return ROLE_LABELS[kind]
+
+
+def _cycle_role(role: tuple[str, int]) -> tuple[str, int]:
+    """season 1 → 2 → … → 9 → specials → extras → skip → season 1."""
+    kind, number = role
+    if kind == "season":
+        return ("season", number + 1) if number < 9 else ("specials", 0)
+    if kind == "specials":
+        return ("extras", 0)
+    if kind == "extras":
+        return ("skip", 0)
+    return ("season", 1)
+
+
+async def _show_merge_plan(query_cb: Any, plan: dict[str, Any]) -> None:
+    """The editable plan: one row per folder, tap to change what it is."""
+    parent: str = plan["parent"]
+    folders: list[str] = plan["folders"]
+    roles: dict[str, tuple[str, int]] = plan["roles"]
+
+    lines = []
+    for f in folders:
+        role = roles[f]
+        if role[0] == "skip":
+            lines.append(f"  • <s>{html.escape(f)}</s> — left alone")
+        else:
+            lines.append(f"  • {html.escape(f)} → <b>{_role_label(role)}</b>")
+
+    moving = [f for f in folders if roles[f][0] != "skip"]
+    seasons = sorted({roles[f][1] for f in moving if roles[f][0] == "season"})
+    clash = len(seasons) != len([f for f in moving if roles[f][0] == "season"])
 
     rows = [
         [
             InlineKeyboardButton(
-                f"{f[:26]} · {_season_label(seasons[f])}",
-                callback_data=f"mseason:{folders.index(f)}",
+                f"{f[:26]} · {_role_label(roles[f])}",
+                callback_data=f"mrole:{folders.index(f)}",
             )
         ]
-        for f in ordered
+        for f in folders
     ]
-    if moving > 1:
+    if len(moving) >= 2 and not clash:
         rows.append([InlineKeyboardButton("🔗 Merge", callback_data="merge_go")])
     rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="merge_no")])
 
     note = (
-        "Tap a row to change its season — it cycles 1, 2, 3 … then Specials, "
-        "then skip.\n\n"
-        "Episodes are moved, not copied — the torrents keep seeding from the "
-        "same files."
+        "Tap a row to change what it is: seasons 1–9, then Specials "
+        "(OVAs and shorts), Extras (openings, adverts), then skip.\n\n"
+        "Episodes are moved, not copied — the torrents keep seeding."
     )
-    if moving < 2:
-        note = "Keep at least two folders to merge, or cancel."
+    if clash:
+        note = "⚠️ Two folders are set to the same season — change one."
+    elif len(moving) < 2:
+        note = "Keep at least two folders, or cancel."
 
     await query_cb.edit_message_text(
-        f"Merge into <b>{html.escape(parent)}</b>:\n\n{plan}\n\n{note}",
+        f"Merge into <b>{html.escape(parent)}</b>:\n\n"
+        + "\n".join(lines)
+        + f"\n\n{note}",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
-async def on_merge_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Cycle one folder's season number."""
+async def on_merge_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cycle one folder's role."""
     query_cb = update.callback_query
     await query_cb.answer()
 
-    pending = context.bot_data.get("merge_confirm")
-    if pending is None:
+    plan = context.bot_data.get("merge_plan")
+    if plan is None:
         await query_cb.edit_message_text("That plan has expired — /merge again.")
         return
 
-    kind, parent, folders, seasons = pending
     _, index = query_cb.data.split(":", 1)
     try:
-        folder = folders[int(index)]
+        folder = plan["folders"][int(index)]
     except (ValueError, IndexError):
         await query_cb.edit_message_text("That plan has expired — /merge again.")
         return
 
-    # 1 → 2 → … → 9 → Specials → skip → 1. Nine is past any real series and
-    # keeps the cycle short enough to tap through.
-    current = seasons[folder]
-    if current == SKIP:
-        seasons[folder] = 1
-    elif current == SPECIALS:
-        seasons[folder] = SKIP
-    elif current >= 9:
-        seasons[folder] = SPECIALS
-    else:
-        seasons[folder] = current + 1
-
-    await _show_merge_plan(query_cb, parent, folders, seasons)
+    plan["roles"][folder] = _cycle_role(plan["roles"][folder])
+    await _show_merge_plan(query_cb, plan)
 
 
 async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -995,38 +1050,42 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query_cb.answer()
 
     if query_cb.data == "merge_no":
+        context.bot_data.pop("merge_plan", None)
+        context.bot_data.pop("merge_pick", None)
         await query_cb.edit_message_text("Left as they are.")
         return
 
-    pending = context.bot_data.pop("merge_confirm", None)
-    if pending is None:
+    plan = context.bot_data.pop("merge_plan", None)
+    if plan is None:
         await query_cb.edit_message_text("That confirmation has expired.")
         return
 
-    kind, parent, folders, seasons = pending
     config: Config = context.bot_data["config"]
-    root = Path(config.media_paths[kind])
+    root = Path(config.media_paths[plan["kind"]])
+    parent: str = plan["parent"]
+    roles: dict[str, tuple[str, int]] = plan["roles"]
 
     # Anything parked at "skip" stays exactly where it is.
-    merging = [f for f in folders if seasons[f] != SKIP]
+    merging = [f for f in plan["folders"] if roles[f][0] != "skip"]
     if len(merging) < 2:
         await query_cb.edit_message_text("Nothing to merge — left as they are.")
         return
 
-    await query_cb.edit_message_text(f"🔗 Merging {html.escape(parent)}…",
-                                     parse_mode=ParseMode.HTML)
+    await query_cb.edit_message_text(
+        f"🔗 Merging {html.escape(parent)}…", parse_mode=ParseMode.HTML
+    )
 
     try:
         moved, problems = await asyncio.to_thread(
-            merge_shows, root, parent, merging, seasons
+            merge_shows, root, parent, merging, {f: roles[f] for f in merging}
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("merge failed for %s", parent)
         await query_cb.edit_message_text(f"Merge failed: {exc}")
         return
 
-    # The follow entries pointed at the old folder names; the show is now one
-    # entry, so the extras would never match anything again.
+    # The follow entries pointed at the old folder names; the show is one
+    # entry now, so the others would never match anything again.
     store: FollowStore = context.bot_data["follows"]
     for folder in merging:
         if folder != parent:
@@ -1039,19 +1098,27 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:  # noqa: BLE001
             log.exception("jellyfin refresh failed after merge")
 
-    skipped = [f for f in folders if seasons[f] == SKIP]
+    seasons = sorted({roles[f][1] for f in merging if roles[f][0] == "season"})
     text = (
-        f"🔗 <b>{html.escape(parent)}</b> — {len(merging)} folders into one\n"
-        f"{moved} episodes filed across "
-        f"{len({seasons[f] for f in merging})} seasons."
+        f"🔗 <b>{html.escape(parent)}</b>\n"
+        f"{len(merging)} folders into one, {moved} files moved."
     )
+    if seasons:
+        text += f"\nSeasons: {', '.join(str(s) for s in seasons)}."
+    if any(roles[f][0] == "specials" for f in merging):
+        text += "\nSpecials → Season 00."
+    if any(roles[f][0] == "extras" for f in merging):
+        text += "\nExtras → extras/."
+
+    skipped = [f for f in plan["folders"] if roles[f][0] == "skip"]
     if skipped:
         text += "\n\n<i>Left alone: " + html.escape(", ".join(skipped)) + "</i>"
     if problems:
-        text += "\n\n<b>Left alone:</b>\n" + "\n".join(
+        text += "\n\n<b>Not moved:</b>\n" + "\n".join(
             f"  • {html.escape(p)}" for p in problems[:5]
         )
     await query_cb.edit_message_text(text, parse_mode=ParseMode.HTML)
+
 
 
 async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2154,7 +2221,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("unfollow", "Stop watching a show"),
             BotCommand("library", "What is on the server"),
             BotCommand("delete", "Remove a show and its torrent"),
-            BotCommand("merge", "Join split seasons into one show"),
+            BotCommand("merge", "Combine folders into one show"),
             BotCommand("disk", "Free space"),
             BotCommand("cleanup", "Delete downloads no torrent owns"),
             BotCommand("add", "Download from a magnet link"),
@@ -2209,8 +2276,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
-    app.add_handler(CallbackQueryHandler(on_merge_choice, pattern=r"^merge:"))
-    app.add_handler(CallbackQueryHandler(on_merge_season, pattern=r"^mseason:"))
+    app.add_handler(CallbackQueryHandler(on_merge_pick, pattern=r"^mpick:"))
+    app.add_handler(CallbackQueryHandler(on_merge_role, pattern=r"^mrole:"))
     app.add_handler(CallbackQueryHandler(on_merge_confirm, pattern=r"^merge_(go|no)$"))
     app.add_handler(CallbackQueryHandler(on_retire_choice, pattern=r"^retire:"))
     app.add_handler(CallbackQueryHandler(on_subtitle_target, pattern=r"^subs:"))
