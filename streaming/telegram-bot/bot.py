@@ -61,10 +61,13 @@ from importer import (
     VIDEO_SUFFIXES,
     attach_subtitles,
     clean_title,
+    existing_folder,
     import_download,
     is_extra,
     match_key,
     merge_shows,
+    title_and_season,
+    title_candidates,
 )
 from ranking import Scored, rank
 from titles import alternative_titles
@@ -234,6 +237,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/library — what's on the server\n"
         "/delete — remove a show and its torrent\n"
         "/merge — combine folders into one show, seasons your choice\n"
+        "/reimport — rebuild a show from its downloads\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
         "<b>Adding things myself</b>\n"
@@ -1170,6 +1174,233 @@ async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     await query_cb.edit_message_text(text, parse_mode=ParseMode.HTML)
 
+
+
+async def cmd_reimport(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rebuild one show's library folder from the downloads it came from.
+
+    The importer improves, but a folder laid out by an older version stays
+    as it was -- files already in place are never revisited. Rather than
+    deleting the folder by hand over ssh and restarting the bot to clear its
+    memory of what it has imported, this does both for one show.
+    """
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    wanted = " ".join(context.args).strip().lower() if context.args else ""
+    folders = await asyncio.to_thread(_mergeable_folders, config, wanted)
+    if not folders:
+        await update.effective_message.reply_text(
+            "Nothing matches. <code>/reimport re zero</code> narrows the list.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    context.bot_data["reimport_list"] = folders[:10]
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"♻️ {name[:30]} · {episodes}", callback_data=f"reimp:{i}"
+            )
+        ]
+        for i, (_, name, episodes) in enumerate(folders[:10])
+    ]
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="reimp:cancel")])
+    await update.effective_message.reply_text(
+        "Rebuild which show?\n\n"
+        "<i>The library folder is deleted and built again from the torrents "
+        "it came from. The downloads are untouched, so nothing is "
+        "re-downloaded — but Jellyfin forgets what you have watched.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_reimport_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, choice = query_cb.data.split(":", 1)
+    if choice == "cancel":
+        await query_cb.edit_message_text("Left as it is.")
+        return
+
+    try:
+        kind, name, episodes = context.bot_data.get("reimport_list", [])[int(choice)]
+    except (ValueError, IndexError):
+        await query_cb.edit_message_text("That list has expired — /reimport again.")
+        return
+
+    context.bot_data["reimport_confirm"] = (kind, name)
+    await query_cb.edit_message_text(
+        f"Rebuild <b>{html.escape(name)}</b>?\n\n"
+        f"{episodes} episodes will be relinked from the downloads.\n"
+        "<i>Watch history for this show is lost.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("♻️ Rebuild", callback_data="reimp_go"),
+                    InlineKeyboardButton("✖️ Cancel", callback_data="reimp_no"),
+                ]
+            ]
+        ),
+    )
+
+
+async def on_reimport_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    if query_cb.data == "reimp_no":
+        context.bot_data.pop("reimport_confirm", None)
+        await query_cb.edit_message_text("Left as it is.")
+        return
+
+    pending = context.bot_data.pop("reimport_confirm", None)
+    if pending is None:
+        await query_cb.edit_message_text("That confirmation has expired.")
+        return
+
+    kind, name = pending
+    config: Config = context.bot_data["config"]
+    qbit: QBittorrentClient = context.bot_data["qbit"]
+    media_root = Path(config.media_paths[kind])
+
+    await query_cb.edit_message_text(
+        f"♻️ Rebuilding {html.escape(name)}…", parse_mode=ParseMode.HTML
+    )
+
+    # Which torrents feed this folder: whichever ones the importer would now
+    # place there. Asking the importer itself means the answer follows the
+    # matching rules rather than guessing from the name.
+    try:
+        torrents = await qbit.torrents(category=CATEGORY)
+    except Exception as exc:  # noqa: BLE001
+        await query_cb.edit_message_text(f"qBittorrent is not responding: {exc}")
+        return
+
+    feeding = [
+        t
+        for t in torrents
+        if (t.get("progress") or 0) >= 1 and _feeds_show(t, config, name)
+    ]
+    if not feeding:
+        await query_cb.edit_message_text(
+            f"No finished torrent feeds <b>{html.escape(name)}</b>, so rebuilding "
+            "it would leave an empty folder. Nothing changed.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Every folder these torrents currently occupy, not just the one picked:
+    # a release that forked off under its own title has to be cleared too, or
+    # rebuilding leaves the split in place.
+    stale = {name}
+    for t in feeding:
+        title, _ = title_and_season(t.get("name") or "")
+        for candidate in [title, *title_candidates(t.get("name") or "")]:
+            match = existing_folder(media_root, candidate)
+            if match:
+                stale.add(match)
+
+    for folder in sorted(stale):
+        try:
+            await asyncio.to_thread(shutil.rmtree, media_root / folder)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            await query_cb.edit_message_text(
+                f"Could not remove {html.escape(folder)}: {exc}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    linked = 0
+    problems: list[str] = []
+    built_as: set[str] = set()
+    for torrent in feeding:
+        content = torrent.get("content_path") or ""
+        try:
+            result = await asyncio.to_thread(
+                import_download,
+                Path(content),
+                media_root,
+                kind,
+                torrent.get("name") or Path(content).name,
+            )
+            linked += result.linked
+            built_as.add(result.title)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("reimport failed for %s", torrent.get("name"))
+            problems.append(f"{(torrent.get('name') or '?')[:40]}: {exc}")
+        # Re-importing means this torrent is no longer "already done".
+        IMPORTED.discard(torrent.get("hash") or "")
+
+    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
+    if jellyfin is not None:
+        try:
+            await jellyfin.refresh_library()
+        except Exception:  # noqa: BLE001
+            log.exception("jellyfin refresh failed after reimport")
+
+    # The rebuild may have settled on a different folder name than the one
+    # picked, if a release names the show more fully than the old folder did.
+    text = f"♻️ Rebuilt from {len(feeding)} torrents, {linked} files.\n"
+    for folder in sorted(built_as):
+        built = await asyncio.to_thread(_describe_folders, media_root, folder)
+        text += f"\n<b>{html.escape(folder)}</b>\n{built}\n"
+    if problems:
+        text += "\n\n<b>Problems:</b>\n" + "\n".join(
+            f"  • {html.escape(p)}" for p in problems[:4]
+        )
+    await query_cb.edit_message_text(text, parse_mode=ParseMode.HTML)
+
+
+def _feeds_show(torrent: dict[str, Any], config: Config, show: str) -> bool:
+    """Whether this torrent belongs to `show`, by any name it goes under.
+
+    Not "which folder does it currently sit in": a release that made its own
+    folder under a Russian title still belongs to the show whose Latin name
+    it also carries, and a rebuild is exactly when that should be noticed.
+    Each candidate name is compared to the folder directly, so the answer
+    does not depend on which folders happen to exist right now.
+    """
+    release = torrent.get("name") or ""
+    title, _ = title_and_season(release)
+    target = match_key(show)
+    for candidate in [title, *title_candidates(release)]:
+        key = match_key(candidate)
+        if not key:
+            continue
+        if key == target:
+            return True
+        # Same prefix rule the importer uses, so "Re Zero kara Hajimeru
+        # Isekai Seikatsu" is recognised as belonging to "Re Zero".
+        if min(len(key), len(target)) >= 6 and (
+            key.startswith(target) or target.startswith(key)
+        ):
+            return True
+    return False
+
+
+def _describe_folders(media_root: Path, name: str) -> str:
+    """A one-line-per-season summary of what a rebuild produced."""
+    show = media_root / name
+    if not show.is_dir():
+        return "<i>(nothing was built)</i>"
+    lines = []
+    for season in sorted(p for p in show.iterdir() if p.is_dir()):
+        videos = sum(
+            1 for f in season.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES
+        )
+        if videos:
+            lines.append(f"  {html.escape(season.name)} — {videos}")
+    loose = sum(1 for f in show.iterdir() if f.suffix.lower() in VIDEO_SUFFIXES)
+    if loose:
+        lines.append(f"  (loose files) — {loose}")
+    return "\n".join(lines) or "<i>(empty)</i>"
 
 
 async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2318,6 +2549,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("library", "What is on the server"),
             BotCommand("delete", "Remove a show and its torrent"),
             BotCommand("merge", "Combine folders into one show"),
+            BotCommand("reimport", "Rebuild a show from its downloads"),
             BotCommand("disk", "Free space"),
             BotCommand("cleanup", "Delete downloads no torrent owns"),
             BotCommand("add", "Download from a magnet link"),
@@ -2364,6 +2596,7 @@ def main() -> None:
     app.add_handler(CommandHandler("disk", cmd_disk, filters=chat_filter))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup, filters=chat_filter))
     app.add_handler(CommandHandler("merge", cmd_merge, filters=chat_filter))
+    app.add_handler(CommandHandler("reimport", cmd_reimport, filters=chat_filter))
     app.add_handler(CommandHandler("add", cmd_add, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
@@ -2372,6 +2605,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
+    app.add_handler(CallbackQueryHandler(on_reimport_choice, pattern=r"^reimp:"))
+    app.add_handler(
+        CallbackQueryHandler(on_reimport_confirm, pattern=r"^reimp_(go|no)$")
+    )
     app.add_handler(CallbackQueryHandler(on_merge_pick, pattern=r"^mpick:"))
     app.add_handler(CallbackQueryHandler(on_merge_role, pattern=r"^mrole:"))
     app.add_handler(CallbackQueryHandler(on_merge_confirm, pattern=r"^merge_(go|no)$"))
