@@ -454,7 +454,12 @@ datacentre IP at login, and no amount of FlareSolverr gets past it, so it
 isn't configured at all. Its releases are still reachable by hand:
 
 - **Send the `.torrent` file to the chat**, or
-- **Paste the magnet link** as a message
+- **`/add <magnet link>`**
+
+The magnet has to go behind a command rather than being pasted on its own:
+the bot keeps Telegram's group privacy mode on, so in a group it only ever
+receives commands, never plain text. Files are exempt from that, which is
+why sending a `.torrent` needs no command.
 
 Either way the bot asks which folder it belongs in and hands it to
 qBittorrent. From there it behaves like anything else — imported into the

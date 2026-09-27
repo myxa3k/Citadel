@@ -226,9 +226,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/delete — remove a show and its torrent\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
-        "<b>Sending me files</b>\n"
-        "• a <b>.torrent</b> or a <b>magnet link</b> — I'll download it. "
-        "Use this for trackers I can't search myself, like RuTracker.\n"
+        "<b>Adding things myself</b>\n"
+        "For trackers I can't search, like RuTracker:\n"
+        "• <b>/add &lt;magnet&gt;</b> — paste the magnet link after the command\n"
+        "• send me a <b>.torrent</b> file\n"
         "• an <b>.ass/.srt</b> file, or a <b>.zip</b> of them — pick the show "
         "and I'll match them to episodes. For when a show has no Russian "
         "release and you found subtitles yourself.\n\n"
@@ -1322,6 +1323,38 @@ async def on_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _do_search(update, context, query)
 
 
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/add <magnet>` -- the explicit form.
+
+    Needed because the bot keeps Telegram's group privacy mode on, so a
+    pasted link never reaches it in a group: only commands do.
+    """
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    link = " ".join(context.args).strip() if context.args else ""
+    if not link:
+        await update.effective_message.reply_text(
+            "Paste a magnet link after the command:\n"
+            "<code>/add magnet:?xt=urn:btih:…</code>\n\n"
+            "A .torrent file sent to the chat works too.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not link.startswith("magnet:"):
+        await update.effective_message.reply_text(
+            "That doesn't look like a magnet link — it should start with "
+            "<code>magnet:?</code>. A link to the tracker page won't work; "
+            "use the one behind “Скачать по magnet-ссылке”.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _add_magnet(update, context, link)
+
+
 async def _add_magnet(
     update: Update, context: ContextTypes.DEFAULT_TYPE, link: str
 ) -> None:
@@ -1666,6 +1699,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("delete", "Remove a show and its torrent"),
             BotCommand("disk", "Free space"),
             BotCommand("cleanup", "Delete downloads no torrent owns"),
+            BotCommand("add", "Download from a magnet link"),
             BotCommand("help", "How this works"),
         ]
     )
@@ -1708,6 +1742,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete", cmd_delete, filters=chat_filter))
     app.add_handler(CommandHandler("disk", cmd_disk, filters=chat_filter))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup, filters=chat_filter))
+    app.add_handler(CommandHandler("add", cmd_add, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
     app.add_handler(CallbackQueryHandler(on_unfollow_choice, pattern=r"^unfollow:"))
