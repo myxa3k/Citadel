@@ -138,6 +138,25 @@ qBittorrent's state name: `💀 no seeders` when the swarm is empty (it will
 never finish — cancel it), `⏳ finding peers` when seeders exist but aren't
 connected yet (usually resolves itself).
 
+**It lists only what is still downloading.** A finished torrent keeps seeding
+for weeks, and listing each one buried the two downloads actually in progress
+under a dozen that weren't — which is the opposite of what the question
+"what's downloading?" is asking. They collapse to a single line instead:
+
+```
+📥 Downloading — 2
+
+• Yuru Yuri S3
+   42.0%  •  ⬇️ 5.0 MB/s • 🌱 8 • ⏱ 15 min
+• Nichijou
+   0.0%  •  💀 no seeders
+
+💀 — nobody is seeding this, it cannot be downloaded.
+Cancel it with /cancel and pick a release that has seeders.
+
+12 finished and seeding — /library
+```
+
 While anything is still downloading, that one message **keeps itself
 current** — it redraws every few seconds and stops once everything is done,
 so there's no need to keep asking. Editing is paced well under Telegram's
@@ -229,6 +248,60 @@ duplicated if the job runs again over the same torrent.
 came from. Both matter — the library files are hardlinks to the download, so
 deleting only one side frees nothing. It takes a second confirming press,
 being the one irreversible action here.
+
+### One show, not five folders
+
+RuTracker posts each season as its own release — season 1, season 2, the OVAs
+and the specials are four separate torrents with four different names. Grab
+all of them and the library ends up with four entries for what is one series.
+Yuru Yuri arrived exactly that way here.
+
+Two things address it.
+
+**New downloads** no longer carry a season into the folder name. A title like
+`Yuru Yuri ss2`, `Yuru Yuri 2nd Season` or `[TV-3]` is split into the show and
+the season number: the folder becomes `Yuru Yuri` and the episodes are filed
+under `Season 02`. The importer also checks for a folder that already holds
+the show before making a new one, comparing on letters and digits alone — so
+`YuruYuri` joins `Yuru Yuri` instead of sitting beside it. Guards keep this
+from firing on titles that merely end in a number: `Steins;Gate 0`,
+`Mob Psycho 100` and `86 Eighty Six` are left alone.
+
+**Folders already split** are repaired by `/merge`. It looks for folders whose
+names share a prefix — compared on letters and digits alone, so `YuruYuri` and
+`Yuru Yuri San Hai` group together despite the spacing — and shows an
+**editable** plan:
+
+```
+Merge into YuruYuri:
+
+  • YuruYuri          → Season 01
+  • YuruYuri ss2      → Season 02
+  • Yuru Yuri San Hai → Season 03
+  • Yuru Yuri Ten     → Specials
+```
+
+Every row is a button. Tapping one cycles its season: 1, 2, 3 … 9, then
+**Specials** (`Season 00`, where Jellyfin expects OVAs and shorts), then
+**skip** — which leaves that folder untouched, because a spin-off like
+`Oomuro-ke` is its own show and not a season of anything.
+
+The numbers only get guessed where a folder name states one. `San Hai` and
+`Ten` carry no number, so the guess falls back to alphabetical order and is
+usually wrong — which is exactly why the plan is editable rather than a
+yes/no confirmation.
+
+Episodes are **moved, not copied**. They're hardlinks into the download, so a
+move keeps the same inode and every torrent carries on seeding from the same
+bytes — the merge costs nothing and breaks nothing. Subtitles follow their
+episode with the language tag intact, so `.ru.ass` stays selectable in
+Jellyfin. A source folder is only removed once it is genuinely empty; if a
+file couldn't move, the folder stays and the reason is reported.
+
+Seasons with unrelated names can't be detected this way — nothing links
+"Yuru Yuri" to a folder called "Yuruyuri Nachuyachumi OVA" if the spelling
+diverges. Rename one in the file browser so it starts with the other's title,
+then run `/merge` again.
 
 ### Seeding review
 

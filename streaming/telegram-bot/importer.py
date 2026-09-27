@@ -66,6 +66,67 @@ COMMON_WORDS = {
     "special", "tv", "ova", "ona", "film",
 }
 
+# A season stated in the title rather than in the episode numbering. Every
+# tracker writes it differently, and each spelling that survives into the
+# folder name splits one show into two -- "Yuru Yuri" and "Yuru Yuri ss2"
+# become separate entries in Jellyfin even though they are one series.
+#
+# Matching these lets the season be lifted out of the title and applied to
+# the episodes instead, which is where Jellyfin expects to find it.
+SEASON_MARKERS = [
+    # "2nd Season", "3rd season"
+    re.compile(r"[\s._\-]+(\d{1,2})(?:st|nd|rd|th)[\s._\-]*season\b", re.I),
+    # "Season 2", "Сезон 2"
+    re.compile(r"[\s._\-]+(?:season|сезон)[\s._\-]*(\d{1,2})\b", re.I),
+    # "ss2", "S2" as a standalone token -- not "S02E01", which the episode
+    # patterns own, and not a trailing letter of a word.
+    re.compile(r"(?![\s._\-]+[Ss]\d{1,2}[Ee]\d)[\s._\-]+(?:ss|s)(\d{1,2})\b", re.I),
+    # A bare trailing number: "Yuru Yuri 2". Last, and deliberately narrow --
+    # a number is only a season when nothing else follows it.
+    re.compile(r"[\s._\-]+(\d{1,2})$"),
+]
+
+
+# "[TV-2]", "[ТВ-3]" -- RuTracker's way of marking a sequel season. Only
+# inside brackets, where the tag actually lives; a loose "TV 2" in a title is
+# more likely part of the name.
+RE_BRACKET_SEASON = re.compile(r"\[\s*(?:TV|ТВ)[\s._\-]*(\d{1,2})\s*\]", re.I)
+
+
+def split_season(raw: str) -> tuple[str, int | None]:
+    """Separate a season stated in the title from the title itself.
+
+    Returns the title with the season marker removed, and the season number
+    if one was found. `"Yuru Yuri ss2"` becomes `("Yuru Yuri", 2)`, so both
+    it and plain `"Yuru Yuri"` land in one library folder with the episodes
+    filed under the right season.
+    """
+    for pattern in SEASON_MARKERS:
+        m = pattern.search(raw)
+        if not m:
+            continue
+        season = int(m.group(1))
+        # Season 0 isn't a thing, and a wildly high number is a year or a
+        # resolution that slipped through rather than a season.
+        if not 1 <= season <= 40:
+            continue
+        stripped = (raw[: m.start()] + raw[m.end() :]).strip(" -_.")
+        # Only if something is left: "S2" alone is not a title.
+        if stripped:
+            return stripped, season
+    return raw, None
+
+
+def match_key(title: str) -> str:
+    """Normalise a title down to what makes two folders the same show.
+
+    Spacing, punctuation and case all vary between releases of one series --
+    "YuruYuri", "Yuru Yuri" and "Yuru-Yuri" are the same thing. Reducing to
+    letters and digits is what lets the importer notice a show already has a
+    folder instead of making a second one beside it.
+    """
+    return re.sub(r"[^a-z0-9а-яё]", "", title.lower())
+
 
 @dataclass(slots=True)
 class ImportResult:
@@ -76,7 +137,23 @@ class ImportResult:
 
 
 def clean_title(raw: str) -> str:
-    """Turn a release folder name into something usable as a library folder."""
+    """Turn a release folder name into something usable as a library folder.
+
+    The season, if the title states one, is *not* part of the result -- see
+    `title_and_season` for that. One show is one folder.
+    """
+    return title_and_season(raw)[0]
+
+
+def title_and_season(raw: str) -> tuple[str, int | None]:
+    """`clean_title`, but also reporting the season the title claimed."""
+    # RuTracker states a sequel season as a bracketed "[TV-2]" tag, which sits
+    # in the technical section the title is about to be cut at. Read it before
+    # that happens -- otherwise the season is simply lost and season 2 files
+    # itself on top of season 1.
+    bracketed = RE_BRACKET_SEASON.search(raw)
+    tagged_season = int(bracketed.group(1)) if bracketed else None
+
     # Fansub groups prefix their name in brackets ("[smol] YuruYuri ..."), and
     # leaving it in means Jellyfin and Bazarr both fail to identify the show.
     # Only square brackets, and only when something follows: "(500) Days of
@@ -108,11 +185,17 @@ def clean_title(raw: str) -> str:
         if looks_like_handle:
             title = title[: group.start()].strip(" -_.")
 
+    # A season written into the title belongs on the episodes, not on the
+    # folder -- otherwise each season of one show becomes its own entry.
+    title, season = split_season(title)
+    if season is None:
+        season = tagged_season
+
     # A colon reads fine on disk but some players mangle it; a dash keeps the
     # phrase legible where a bare removal would run words together.
     title = title.replace(":", " -")
     title = re.sub(r"\s{2,}", " ", title).strip(" -_.")
-    return re.sub(r'[<>"/\\|?*]', "-", title) or "Unknown"
+    return re.sub(r'[<>"/\\|?*]', "-", title) or "Unknown", season
 
 
 def episode_number(name: str) -> tuple[int, int] | None:
@@ -260,6 +343,132 @@ def attach_subtitles(
     return attached, unmatched
 
 
+def suggest_merges(media_root: Path) -> list[tuple[str, list[str]]]:
+    """Folders in one library that look like seasons of the same show.
+
+    Buying each season as its own tracker release is the normal way to get an
+    anime that ran over several years, and it leaves the library with one
+    folder per release. This finds the sets worth collapsing: folders whose
+    names agree on a prefix long enough to be a title rather than a
+    coincidence.
+
+    Returns (suggested parent title, folder names) for each group, so the
+    caller can confirm before anything moves.
+    """
+    try:
+        raw = [p.name for p in media_root.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+    # Sorted by the normalised key, not the raw name, so the bare title always
+    # comes before the titles built on top of it. Sorting by raw name puts
+    # "YuruYuri" *after* "Yuru Yuri San Hai" -- a space sorts before a letter
+    # -- and the shortest name is then never the one that gets to collect the
+    # others, which is how a real group silently went unfound.
+    names = sorted(raw, key=lambda n: (match_key(n), n))
+
+    groups: list[tuple[str, list[str]]] = []
+    used: set[str] = set()
+
+    for i, name in enumerate(names):
+        if name in used:
+            continue
+        base = match_key(name)
+        if len(base) < 4:
+            # Too short to distinguish a real shared title from two unrelated
+            # shows that happen to start alike.
+            continue
+
+        members = [name]
+        for other in names[i + 1 :]:
+            if other in used:
+                continue
+            key = match_key(other)
+            # One is a prefix of the other: "yuruyuri" against
+            # "yuruyurisanhai". That's the shape a sequel's title takes --
+            # the original plus a subtitle.
+            if key.startswith(base) and len(key) > len(base):
+                members.append(other)
+
+        if len(members) > 1:
+            used.update(members)
+            # The shortest *key* is the bare series title; the others are it
+            # plus a season subtitle. Measured on the key so that spacing
+            # doesn't decide which folder name the merged show ends up under.
+            groups.append((min(members, key=lambda n: len(match_key(n))), members))
+
+    return groups
+
+
+def merge_shows(
+    media_root: Path, parent: str, folders: list[str], seasons: dict[str, int]
+) -> tuple[int, list[str]]:
+    """Fold several show folders into one, each as its own season.
+
+    Files are *moved*, not copied -- they are hardlinks into the download, so
+    moving one keeps the same inode and the torrent keeps seeding from it
+    untouched. Nothing is deleted except the emptied folders.
+
+    Returns (files moved, problems).
+    """
+    target_root = media_root / parent
+    target_root.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    problems: list[str] = []
+
+    for folder in folders:
+        source = media_root / folder
+        season = seasons.get(folder, 1)
+        if not source.is_dir():
+            continue
+
+        for f in sorted(source.rglob("*")):
+            if not f.is_file():
+                continue
+
+            parsed = episode_number(f.name) or episode_number(f.parent.name)
+            episode = parsed[1] if parsed else None
+
+            destination = target_root / f"Season {season:02d}"
+            destination.mkdir(parents=True, exist_ok=True)
+
+            if episode is None:
+                # No number to file it under; keep the original name so
+                # nothing is silently lost.
+                target = destination / f.name
+            else:
+                # Subtitles carry a language part before the extension that
+                # has to survive the rename, or Jellyfin stops matching them.
+                suffix = f.suffix
+                if suffix.lower() in SUBTITLE_SUFFIXES:
+                    lang = f.stem.rsplit(".", 1)
+                    if len(lang) == 2 and 1 <= len(lang[1]) <= 8:
+                        suffix = f".{lang[1]}{suffix}"
+                target = destination / f"{parent} - S{season:02d}E{episode:02d}{suffix}"
+
+            if target.exists():
+                continue
+            try:
+                f.rename(target)
+                moved += 1
+            except OSError as exc:
+                problems.append(f"{f.name}: {exc}")
+
+        if source == target_root:
+            continue
+        # Only the now-empty shell goes. Anything left behind means a file
+        # didn't move, and deleting the folder then would lose it.
+        if any(p.is_file() for p in source.rglob("*")):
+            problems.append(f"{folder}: files left behind, folder kept")
+            continue
+        try:
+            shutil.rmtree(source)
+        except OSError as exc:
+            problems.append(f"{folder}: {exc}")
+
+    return moved, problems
+
+
 def _video_files(source: Path) -> list[Path]:
     if source.is_file():
         return [source] if source.suffix.lower() in VIDEO_SUFFIXES else []
@@ -272,6 +481,26 @@ def _video_files(source: Path) -> list[Path]:
     )
 
 
+def existing_folder(media_root: Path, title: str) -> str | None:
+    """The library folder already holding this show, if there is one.
+
+    Matching ignores spacing and punctuation, so a release that cleans up as
+    "YuruYuri" joins the "Yuru Yuri" folder rather than starting a rival one
+    next to it.
+    """
+    key = match_key(title)
+    if not key:
+        return None
+    try:
+        entries = sorted(p.name for p in media_root.iterdir() if p.is_dir())
+    except OSError:
+        return None
+    for name in entries:
+        if match_key(name) == key:
+            return name
+    return None
+
+
 def import_download(
     source: Path, media_root: Path, kind: str, release_name: str
 ) -> ImportResult:
@@ -280,8 +509,16 @@ def import_download(
     Films go in as `<Title>/<Title>.mkv`; anything with episode numbering gets
     `<Title>/Season NN/<Title> - SNNENN.mkv`, which is the layout Jellyfin
     parses without help.
+
+    A season named in the release title ("... ss2") is applied to the
+    episodes, and an existing folder for the same show is reused, so seasons
+    downloaded separately still end up as one series.
     """
-    title = clean_title(release_name)
+    title, stated_season = title_and_season(release_name)
+    if kind != "movies":
+        # Reuse the spelling already on disk, so the folder doesn't fork over
+        # a difference in spacing.
+        title = existing_folder(media_root, title) or title
     files = _video_files(source)
     if not files:
         return ImportResult(title, media_root, 0, 0)
@@ -308,6 +545,10 @@ def import_download(
 
     for f in files:
         parsed = episode_number(f.name) or episode_number(f.parent.name)
+        # "Yuru Yuri ss2 - 05.mkv" numbers the episode but not the season;
+        # the season came from the release title, so put it back.
+        if parsed is not None and stated_season is not None and parsed[0] == 1:
+            parsed = (stated_season, parsed[1])
         if parsed is None:
             # Unnumbered: keep it rather than drop it, and let Jellyfin sort
             # out what it is.

@@ -17,3 +17,8 @@ jellyfin/cache/
 *.bak
 *.swp
 .DS_Store
+__pycache__/
+*.pyc
+
+# Followed-show state, written by the bot at runtime.
+telegram-bot/state/

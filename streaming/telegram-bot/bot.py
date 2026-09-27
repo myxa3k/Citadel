@@ -61,6 +61,10 @@ from importer import (
     attach_subtitles,
     clean_title,
     import_download,
+    match_key,
+    merge_shows,
+    split_season,
+    suggest_merges,
 )
 from ranking import Scored, rank
 from titles import alternative_titles
@@ -229,6 +233,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Library</b>\n"
         "/library — what's on the server\n"
         "/delete — remove a show and its torrent\n"
+        "/merge — join split seasons into one show\n"
         "/disk — free space\n"
         "/cleanup — delete downloads no torrent owns\n\n"
         "<b>Adding things myself</b>\n"
@@ -247,14 +252,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def _status_text(torrents: list[dict[str, Any]]) -> tuple[str, bool]:
     """Render the downloads list. Returns the text and whether any are active.
 
+    Only what is still downloading is listed in full. Finished torrents stay
+    in qBittorrent for as long as they seed, which is weeks -- listing them
+    here line by line buries the two things actually in progress under
+    twenty that aren't, and /status is a question about the former.
+    They collapse into a single seeding count instead.
+
     "Active" drives the live refresh: once nothing is moving there is nothing
     left to redraw, so the updater stops rather than editing the same message
     forever.
     """
+    pending = [t for t in torrents if (t.get("progress") or 0) < 1]
+    finished = len(torrents) - len(pending)
+
+    if not pending:
+        text = "📥 <b>Downloads</b>\n\nNothing downloading."
+        if finished:
+            text += f"\n<i>{finished} finished, seeding.</i>"
+        return text, False
+
     lines = []
     stuck = False
-    active = False
-    for t in torrents[:15]:
+    for t in pending[:15]:
         pct = (t.get("progress") or 0) * 100
         speed = (t.get("dlspeed") or 0) / (1024**2)
         seeds = t.get("num_seeds") or 0
@@ -264,11 +283,11 @@ def _status_text(torrents: list[dict[str, Any]]) -> tuple[str, bool]:
         state, detail = _describe(t, seeds, swarm_seeds, speed, eta)
         if "💀" in state:
             stuck = True
-        if (t.get("progress") or 0) < 1:
-            active = True
         lines.append(f"• {name}\n   {pct:.1f}%  •  {state}{detail}")
 
-    text = "📥 <b>Downloads</b>\n\n" + "\n".join(lines)
+    text = f"📥 <b>Downloading</b> — {len(pending)}\n\n" + "\n".join(lines)
+    if len(pending) > 15:
+        text += f"\n\n<i>…and {len(pending) - 15} more.</i>"
     if stuck:
         # Otherwise a dead torrent just sits at 0% forever with no explanation
         # of why, which looks identical to "still starting up".
@@ -276,7 +295,11 @@ def _status_text(torrents: list[dict[str, Any]]) -> tuple[str, bool]:
             "\n\n💀 — nobody is seeding this, it cannot be downloaded.\n"
             "Cancel it with /cancel and pick a release that has seeders."
         )
-    return text, active
+    if finished:
+        # Worth one line: it explains where the disk went, and /library is
+        # the place to actually look at them.
+        text += f"\n\n<i>{finished} finished and seeding — /library</i>"
+    return text, True
 
 
 # How often the live status message redraws, and for how long. Telegram rate
@@ -308,6 +331,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     message = await update.effective_message.reply_text(
         text + ("\n\n<i>updating live…</i>" if active else ""),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
     if not active:
@@ -335,7 +359,7 @@ async def _follow_status(context: ContextTypes.DEFAULT_TYPE, message: Any) -> No
             return
 
         text, active = _status_text(torrents)
-        suffix = "\n\n<i>updating live…</i>" if active else "\n\n<i>finished</i>"
+        suffix = "\n\n<i>updating live…</i>" if active else "\n\n<i>all done</i>"
         body = text + suffix
 
         # Telegram rejects an edit that changes nothing, and a stalled
@@ -751,6 +775,283 @@ async def cmd_library(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"📚 <b>Library</b> — {_human(grand)} total\n" + "\n".join(lines),
         parse_mode=ParseMode.HTML,
     )
+
+
+def _merge_candidates(config: Config) -> list[tuple[str, str, list[str]]]:
+    """Groups of folders across the library that look like one show."""
+    found: list[tuple[str, str, list[str]]] = []
+    for kind in ("anime", "series"):
+        root = config.media_paths.get(kind)
+        if not root:
+            continue
+        for parent, folders in suggest_merges(Path(root)):
+            found.append((kind, parent, folders))
+    return found
+
+
+def _propose_seasons(parent: str, folders: list[str]) -> dict[str, int]:
+    """Guess which season each folder holds.
+
+    A number in the folder name is the best evidence -- the importer strips
+    seasons now, but these folders predate that. Failing that, the bare
+    series title is season 1 and the rest follow in alphabetical order,
+    which for a numbered franchise is usually release order too.
+    """
+    seasons: dict[str, int] = {}
+    unnumbered: list[str] = []
+
+    for folder in folders:
+        # Reuse the same markers the importer uses, against the part of the
+        # name that isn't the shared title.
+        _, season = split_season(folder)
+        if season is not None:
+            seasons[folder] = season
+        elif folder == parent:
+            seasons[folder] = 1
+        else:
+            unnumbered.append(folder)
+
+    # Fill the gaps with whatever numbers are still free, in order.
+    taken = set(seasons.values())
+    nxt = 1
+    for folder in sorted(unnumbered):
+        while nxt in taken:
+            nxt += 1
+        seasons[folder] = nxt
+        taken.add(nxt)
+
+    return seasons
+
+
+async def cmd_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fold separately-downloaded seasons of one show into a single entry.
+
+    Downloading each season as its own tracker release -- the only option on
+    RuTracker, where every season is a separate posting -- leaves the library
+    with one folder per release instead of one per show.
+    """
+    config: Config = context.bot_data["config"]
+    if not _authorised(config, update):
+        return
+
+    groups = await asyncio.to_thread(_merge_candidates, config)
+    if not groups:
+        await update.effective_message.reply_text(
+            "Nothing looks like it needs merging — every show is one folder.\n\n"
+            "If two folders belong together but have unrelated names, "
+            "rename one in Jellyfin's file browser so it starts with the "
+            "other's title, then run /merge again."
+        )
+        return
+
+    context.bot_data["merge_groups"] = groups
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🔗 {parent[:30]} ({len(folders)})", callback_data=f"merge:{i}"
+            )
+        ]
+        for i, (_, parent, folders) in enumerate(groups[:10])
+    ]
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="merge:cancel")])
+
+    listing = "\n\n".join(
+        f"<b>{html.escape(parent)}</b>\n"
+        + "\n".join(f"  • {html.escape(f)}" for f in folders)
+        for _, parent, folders in groups[:10]
+    )
+    await update.effective_message.reply_text(
+        f"These look like seasons of the same show:\n\n{listing}\n\n"
+        "Merging moves the episodes into one folder, each as its own season. "
+        "Seeding is unaffected.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_merge_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    _, choice = query_cb.data.split(":", 1)
+    if choice == "cancel":
+        await query_cb.edit_message_text("Left as they are.")
+        return
+
+    groups = context.bot_data.get("merge_groups", [])
+    try:
+        kind, parent, folders = groups[int(choice)]
+    except (ValueError, IndexError):
+        await query_cb.edit_message_text("That list has expired — /merge again.")
+        return
+
+    seasons = _propose_seasons(parent, folders)
+    context.bot_data["merge_confirm"] = (kind, parent, folders, seasons)
+    await _show_merge_plan(query_cb, parent, folders, seasons)
+
+
+# Season a folder is parked at to mean "leave this one alone". Spin-offs and
+# shorts are their own show in every metadata provider -- Oomuro-ke is not a
+# season of Yuru Yuri -- so excluding one has to be as easy as renumbering it.
+SKIP = -1
+# Jellyfin reads Season 00 as the specials folder, which is what OVAs and
+# shorts attached to a series actually are.
+SPECIALS = 0
+
+
+def _season_label(season: int) -> str:
+    if season == SKIP:
+        return "skip"
+    if season == SPECIALS:
+        return "Specials"
+    return f"Season {season:02d}"
+
+
+async def _show_merge_plan(
+    query_cb: Any, parent: str, folders: list[str], seasons: dict[str, int]
+) -> None:
+    """The editable plan: one row per folder, tap to change its season.
+
+    Guessing the order from folder names only works when they're numbered.
+    "San Hai" and "Nachuyachumi" carry no number at all, so the guess is
+    alphabetical and usually wrong -- which would be fine if it weren't the
+    one screen standing between a wrong guess and files moving. Hence every
+    number is adjustable before anything happens.
+    """
+    ordered = sorted(folders, key=lambda f: (seasons[f] == SKIP, seasons[f], f))
+
+    plan = "\n".join(
+        f"  • {html.escape(f)} → <b>{_season_label(seasons[f])}</b>"
+        if seasons[f] != SKIP
+        else f"  • <s>{html.escape(f)}</s> → left alone"
+        for f in ordered
+    )
+    moving = sum(1 for f in folders if seasons[f] != SKIP)
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"{f[:26]} · {_season_label(seasons[f])}",
+                callback_data=f"mseason:{folders.index(f)}",
+            )
+        ]
+        for f in ordered
+    ]
+    if moving > 1:
+        rows.append([InlineKeyboardButton("🔗 Merge", callback_data="merge_go")])
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="merge_no")])
+
+    note = (
+        "Tap a row to change its season — it cycles 1, 2, 3 … then Specials, "
+        "then skip.\n\n"
+        "Episodes are moved, not copied — the torrents keep seeding from the "
+        "same files."
+    )
+    if moving < 2:
+        note = "Keep at least two folders to merge, or cancel."
+
+    await query_cb.edit_message_text(
+        f"Merge into <b>{html.escape(parent)}</b>:\n\n{plan}\n\n{note}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def on_merge_season(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cycle one folder's season number."""
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    pending = context.bot_data.get("merge_confirm")
+    if pending is None:
+        await query_cb.edit_message_text("That plan has expired — /merge again.")
+        return
+
+    kind, parent, folders, seasons = pending
+    _, index = query_cb.data.split(":", 1)
+    try:
+        folder = folders[int(index)]
+    except (ValueError, IndexError):
+        await query_cb.edit_message_text("That plan has expired — /merge again.")
+        return
+
+    # 1 → 2 → … → 9 → Specials → skip → 1. Nine is past any real series and
+    # keeps the cycle short enough to tap through.
+    current = seasons[folder]
+    if current == SKIP:
+        seasons[folder] = 1
+    elif current == SPECIALS:
+        seasons[folder] = SKIP
+    elif current >= 9:
+        seasons[folder] = SPECIALS
+    else:
+        seasons[folder] = current + 1
+
+    await _show_merge_plan(query_cb, parent, folders, seasons)
+
+
+async def on_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query_cb = update.callback_query
+    await query_cb.answer()
+
+    if query_cb.data == "merge_no":
+        await query_cb.edit_message_text("Left as they are.")
+        return
+
+    pending = context.bot_data.pop("merge_confirm", None)
+    if pending is None:
+        await query_cb.edit_message_text("That confirmation has expired.")
+        return
+
+    kind, parent, folders, seasons = pending
+    config: Config = context.bot_data["config"]
+    root = Path(config.media_paths[kind])
+
+    # Anything parked at "skip" stays exactly where it is.
+    merging = [f for f in folders if seasons[f] != SKIP]
+    if len(merging) < 2:
+        await query_cb.edit_message_text("Nothing to merge — left as they are.")
+        return
+
+    await query_cb.edit_message_text(f"🔗 Merging {html.escape(parent)}…",
+                                     parse_mode=ParseMode.HTML)
+
+    try:
+        moved, problems = await asyncio.to_thread(
+            merge_shows, root, parent, merging, seasons
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.exception("merge failed for %s", parent)
+        await query_cb.edit_message_text(f"Merge failed: {exc}")
+        return
+
+    # The follow entries pointed at the old folder names; the show is now one
+    # entry, so the extras would never match anything again.
+    store: FollowStore = context.bot_data["follows"]
+    for folder in merging:
+        if folder != parent:
+            store.remove(folder)
+
+    jellyfin: JellyfinClient | None = context.bot_data.get("jellyfin")
+    if jellyfin is not None:
+        try:
+            await jellyfin.refresh_library()
+        except Exception:  # noqa: BLE001
+            log.exception("jellyfin refresh failed after merge")
+
+    skipped = [f for f in folders if seasons[f] == SKIP]
+    text = (
+        f"🔗 <b>{html.escape(parent)}</b> — {len(merging)} folders into one\n"
+        f"{moved} episodes filed across "
+        f"{len({seasons[f] for f in merging})} seasons."
+    )
+    if skipped:
+        text += "\n\n<i>Left alone: " + html.escape(", ".join(skipped)) + "</i>"
+    if problems:
+        text += "\n\n<b>Left alone:</b>\n" + "\n".join(
+            f"  • {html.escape(p)}" for p in problems[:5]
+        )
+    await query_cb.edit_message_text(text, parse_mode=ParseMode.HTML)
 
 
 async def cmd_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1362,9 +1663,12 @@ async def on_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         # Match torrents by the title the importer derived from them, so the
         # seeding copy goes too -- otherwise the disk space is never actually
         # reclaimed, since the library files are hardlinks to it.
+        # Compared on the normalised key, so a merged show removes every
+        # season's torrent however each one happened to be spelled.
+        wanted = match_key(title)
         for torrent in await qbit.torrents():
             name = torrent.get("name") or ""
-            if clean_title(name).lower() == title.lower():
+            if match_key(clean_title(name)) == wanted:
                 await qbit.delete(torrent.get("hash", ""), delete_files=True)
                 removed_torrents += 1
     except Exception:  # noqa: BLE001 - carry on and still remove the library copy
@@ -1850,6 +2154,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("unfollow", "Stop watching a show"),
             BotCommand("library", "What is on the server"),
             BotCommand("delete", "Remove a show and its torrent"),
+            BotCommand("merge", "Join split seasons into one show"),
             BotCommand("disk", "Free space"),
             BotCommand("cleanup", "Delete downloads no torrent owns"),
             BotCommand("add", "Download from a magnet link"),
@@ -1895,6 +2200,7 @@ def main() -> None:
     app.add_handler(CommandHandler("delete", cmd_delete, filters=chat_filter))
     app.add_handler(CommandHandler("disk", cmd_disk, filters=chat_filter))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup, filters=chat_filter))
+    app.add_handler(CommandHandler("merge", cmd_merge, filters=chat_filter))
     app.add_handler(CommandHandler("add", cmd_add, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^del:"))
     app.add_handler(CallbackQueryHandler(on_follow_choice, pattern=r"^follow:"))
@@ -1903,6 +2209,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_delete_show, pattern=r"^del_show:"))
     app.add_handler(CallbackQueryHandler(on_delete_confirm, pattern=r"^del_(yes|no)$"))
     app.add_handler(CallbackQueryHandler(on_cleanup_choice, pattern=r"^cleanup:"))
+    app.add_handler(CallbackQueryHandler(on_merge_choice, pattern=r"^merge:"))
+    app.add_handler(CallbackQueryHandler(on_merge_season, pattern=r"^mseason:"))
+    app.add_handler(CallbackQueryHandler(on_merge_confirm, pattern=r"^merge_(go|no)$"))
     app.add_handler(CallbackQueryHandler(on_retire_choice, pattern=r"^retire:"))
     app.add_handler(CallbackQueryHandler(on_subtitle_target, pattern=r"^subs:"))
     app.add_handler(CallbackQueryHandler(on_torrent_target, pattern=r"^tor:"))
